@@ -1,0 +1,29 @@
+# ----------------------------------------------------------------------
+# Teknic ClearCore — application + bootloader USB devices
+# ----------------------------------------------------------------------
+# Place this file at /etc/udev/rules.d/99-teknic-clearcore.rules and run
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger
+#
+# Two purposes:
+#   1. Grant the dialout group RW access to /dev/ttyACM* belonging to a
+#      ClearCore, regardless of which group inherits the kernel default.
+#   2. Tell udev NOT to probe the bootloader's USB Mass Storage interface
+#      with blkid. The bootloader presents a tiny FAT volume that's slow
+#      to respond to SCSI INQUIRY/READ commands, which causes udev to
+#      hang on first connect for ~30 seconds — and during that hang the
+#      device shows up in /dev as /dev/sdN but is unmountable. Setting
+#      UDISKS_IGNORE also stops desktop auto-mount daemons from fighting.
+
+# Application mode — running sketch
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2890", ATTRS{idProduct}=="8022", \
+    GROUP="dialout", MODE="0660", SYMLINK+="clearcore"
+
+# Bootloader mode — appears briefly during upload
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2890", ATTRS{idProduct}=="0022", \
+    GROUP="dialout", MODE="0660", SYMLINK+="clearcore-boot"
+
+# Bootloader mass-storage interface — do not probe, do not auto-mount
+SUBSYSTEM=="block", ATTRS{idVendor}=="2890", ATTRS{idProduct}=="0022", \
+    ENV{UDISKS_IGNORE}="1", ENV{UDISKS_AUTO}="0", \
+    ENV{ID_FS_TYPE_NOT_PROBED}="1"
