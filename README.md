@@ -140,11 +140,22 @@ sudo apt install -y libfuse2t64    # or libfuse2 on older Ubuntu
 ```bash
 git clone https://github.com/RobotBuzzard/teknic-clearcore-cli.git
 cd teknic-clearcore-cli
+scripts/preflight.sh                                                      # confirms port is free
 arduino-cli compile --fqbn ClearCore:sam:clearcore examples/BlinkLED
 arduino-cli upload  --fqbn ClearCore:sam:clearcore -p /dev/ttyACM0 examples/BlinkLED
 ```
 
 The on-board USR LED should blink at 1 Hz. If it does, the toolchain is good.
+
+**This is the canonical iterate-loop for every sketch on every flash:**
+
+```bash
+scripts/preflight.sh && \
+arduino-cli compile --fqbn ClearCore:sam:clearcore <sketch_dir> && \
+arduino-cli upload  --fqbn ClearCore:sam:clearcore -p /dev/ttyACM0 <sketch_dir>
+```
+
+The `&&` chain bails early if any step fails — most often `preflight.sh` will be the gate when you've left a Serial Monitor open.
 
 ---
 

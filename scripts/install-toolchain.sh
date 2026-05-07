@@ -103,5 +103,9 @@ fi
 log "Done."
 echo
 echo "Smoke test:"
+echo "  $REPO_ROOT/scripts/preflight.sh"
 echo "  arduino-cli compile --fqbn ClearCore:sam:clearcore $REPO_ROOT/examples/BlinkLED"
 echo "  arduino-cli upload  --fqbn ClearCore:sam:clearcore -p /dev/ttyACM0 $REPO_ROOT/examples/BlinkLED"
+echo
+echo "Tip: chain with && so a failed preflight aborts the upload:"
+echo "  $REPO_ROOT/scripts/preflight.sh && arduino-cli compile … && arduino-cli upload …"
