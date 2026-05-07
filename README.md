@@ -150,12 +150,29 @@ The on-board USR LED should blink at 1 Hz. If it does, the toolchain is good.
 **This is the canonical iterate-loop for every sketch on every flash:**
 
 ```bash
+scripts/flash.sh <sketch_dir>
+```
+
+[`scripts/flash.sh`](scripts/flash.sh) wraps preflight + compile + a state-aware upload that's matched the Arduino IDE 2's reliability across stress tests on this bench (3-for-3 back-to-back flashes, no stuck-bootloader recovery needed). It:
+
+- Runs `preflight.sh` first
+- Compiles to a clean output dir with `arduino-cli compile`
+- Detects current device state (PID `8022` app, `0022` bootloader, or absent)
+- If in app mode: triggers bootloader entry with a controlled 1200-baud touch via `pyserial`, polls for the bootloader USB descriptor, and gives CDC an extra 1 s settle window — what the IDE does implicitly
+- If already in bootloader: skips the touch entirely (re-touching a device already in BL is what produces the classic `Set binary mode / No device found` failure)
+- Calls `bossac` directly **without `-a`** — no double-touch race
+- Retries `bossac` up to 3 times with 2 s backoff (the bootloader has no timeout, so retry converges instead of getting stuck)
+- Verifies the device returns to PID `8022` running the new firmware
+
+If you need the lower-level commands (e.g., to integrate into a different build system), the raw arduino-cli flow still works:
+
+```bash
 scripts/preflight.sh && \
 arduino-cli compile --fqbn ClearCore:sam:clearcore <sketch_dir> && \
 arduino-cli upload  --fqbn ClearCore:sam:clearcore -p /dev/ttyACM0 <sketch_dir>
 ```
 
-The `&&` chain bails early if any step fails — most often `preflight.sh` will be the gate when you've left a Serial Monitor open.
+…but be aware the raw `arduino-cli upload` can occasionally race the CDC re-enumeration and leave the device in a stuck-bootloader state that needs a power-cycle to clear. `flash.sh` exists specifically to avoid that.
 
 ---
 
@@ -252,7 +269,7 @@ Total time for a 137 KB sketch: ~3 seconds.
 |---|---|---|
 | `Set binary mode` then `No device found on ttyACM0` | **ModemManager** grabbed the port during bootloader re-enumeration | `sudo systemctl mask --now ModemManager` (step 4b) |
 | `No upload port found, using /dev/ttyACM0 as fallback` followed by `Failed to open port at 1200bps`, device stays at PID `8022` | Another process holds `/dev/ttyACM0`, so the 1200-bps touch never reaches the firmware. **Most common offender: the Arduino IDE's Serial Monitor.** Also `screen`, `minicom`, `cu`, `picocom`, or a `cat` left running. **See the warning at the top of the Upload section.** | Close the Serial Monitor (or whatever has the port), then retry. Diagnose with `lsof /dev/ttyACM0` or run `scripts/preflight.sh`. |
-| Device stuck at PID `0022` (bootloader), `arduino-cli upload` fails with `Set binary mode / No device found` even with port free | The 1200-bps touch on a device that's *already* in bootloader briefly resets the bootloader's CDC interface; bossac then tries to talk to a not-yet-ready port. | Either power-cycle the ClearCore back to PID `8022` (then upload normally), or force-skip the touch with `--upload-property use_1200bps_touch=false --upload-property wait_for_upload_port=false`. |
+| Device stuck at PID `0022` (bootloader), `arduino-cli upload` fails with `Set binary mode / No device found` even with port free | The 1200-bps touch on a device that's *already* in bootloader briefly resets the bootloader's CDC interface; bossac then tries to talk to a not-yet-ready port. **`arduino-cli`'s `--upload-property use_1200bps_touch=false` does NOT actually skip the touch in v1.4.1 — verified by `--verbose` output.** | Use `scripts/flash.sh` instead — it detects bootloader state and skips the touch when the device is already there. As a last resort, power-cycle the ClearCore. |
 | `Failed to open port at 1200bps` | User not in `dialout`, or perm race after re-enum | Step 4a (relog into `dialout`) and/or 4c (udev rule) |
 | `No upload port found, using /dev/ttyACM0 as fallback` | Bootloader entered but the kernel hasn't created a new tty yet | Usually benign — bossac retries. If persistent, increase the bootloader-wait timeout or use the udev rule. |
 | `arduino-cli board list` shows `No boards found` after a failed upload | Device stuck in bootloader (PID `0022`) | Power-cycle the ClearCore. The bootloader doesn't time out on its own. |
