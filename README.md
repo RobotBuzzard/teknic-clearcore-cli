@@ -207,6 +207,10 @@ Global variables use NNNN bytes of dynamic memory.
 
 ## Upload
 
+> ⚠️ **Before every upload: close any Serial Monitor / terminal that's holding the port.** This is the single most common cause of `arduino-cli upload` failures during bench iteration. The 1200-baud touch needs to *open the port itself* — if anything else has it (Arduino IDE 2's Serial Monitor, `screen`, `minicom`, `cu`, `picocom`, a stray `cat`), the touch silently fails, the device never enters bootloader, and bossac then fails with `Set binary mode / No device found / Failed to open port at 1200bps`. The IDE's own upload sidesteps this because it auto-closes its monitor first; `arduino-cli` doesn't have that hook.
+>
+> Quick check: `lsof /dev/ttyACM0` (empty output = free). Or run [`scripts/preflight.sh`](scripts/preflight.sh) — it'll name the offending process.
+
 ```bash
 arduino-cli upload --fqbn ClearCore:sam:clearcore -p /dev/ttyACM0 /path/to/MySketch
 ```
@@ -236,7 +240,8 @@ Total time for a 137 KB sketch: ~3 seconds.
 | Symptom | Probable cause | Fix |
 |---|---|---|
 | `Set binary mode` then `No device found on ttyACM0` | **ModemManager** grabbed the port during bootloader re-enumeration | `sudo systemctl mask --now ModemManager` (step 4b) |
-| `No upload port found, using /dev/ttyACM0 as fallback` followed by `Failed to open port at 1200bps`, device stays at PID `8022` | Another process holds `/dev/ttyACM0`, so the 1200-bps touch never reaches the firmware. **Most common offender: the Arduino IDE's Serial Monitor.** Also `screen`, `minicom`, `cu`, `picocom`, or a `cat` left running. | Close the Serial Monitor (or whatever has the port), then retry. Diagnose with `sudo fuser -v /dev/ttyACM0` or `sudo lsof /dev/ttyACM0`. |
+| `No upload port found, using /dev/ttyACM0 as fallback` followed by `Failed to open port at 1200bps`, device stays at PID `8022` | Another process holds `/dev/ttyACM0`, so the 1200-bps touch never reaches the firmware. **Most common offender: the Arduino IDE's Serial Monitor.** Also `screen`, `minicom`, `cu`, `picocom`, or a `cat` left running. **See the warning at the top of the Upload section.** | Close the Serial Monitor (or whatever has the port), then retry. Diagnose with `lsof /dev/ttyACM0` or run `scripts/preflight.sh`. |
+| Device stuck at PID `0022` (bootloader), `arduino-cli upload` fails with `Set binary mode / No device found` even with port free | The 1200-bps touch on a device that's *already* in bootloader briefly resets the bootloader's CDC interface; bossac then tries to talk to a not-yet-ready port. | Either power-cycle the ClearCore back to PID `8022` (then upload normally), or force-skip the touch with `--upload-property use_1200bps_touch=false --upload-property wait_for_upload_port=false`. |
 | `Failed to open port at 1200bps` | User not in `dialout`, or perm race after re-enum | Step 4a (relog into `dialout`) and/or 4c (udev rule) |
 | `No upload port found, using /dev/ttyACM0 as fallback` | Bootloader entered but the kernel hasn't created a new tty yet | Usually benign — bossac retries. If persistent, increase the bootloader-wait timeout or use the udev rule. |
 | `arduino-cli board list` shows `No boards found` after a failed upload | Device stuck in bootloader (PID `0022`) | Power-cycle the ClearCore. The bootloader doesn't time out on its own. |
