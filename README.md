@@ -140,9 +140,7 @@ sudo apt install -y libfuse2t64    # or libfuse2 on older Ubuntu
 ```bash
 git clone https://github.com/RobotBuzzard/teknic-clearcore-cli.git
 cd teknic-clearcore-cli
-scripts/preflight.sh                                                      # confirms port is free
-arduino-cli compile --fqbn ClearCore:sam:clearcore examples/BlinkLED
-arduino-cli upload  --fqbn ClearCore:sam:clearcore -p /dev/ttyACM0 examples/BlinkLED
+scripts/flash.sh examples/BlinkLED
 ```
 
 The on-board USR LED should blink at 1 Hz. If it does, the toolchain is good.
@@ -235,13 +233,17 @@ Global variables use NNNN bytes of dynamic memory.
 
 ## Upload
 
-> ⚠️ **Before every upload: close any Serial Monitor / terminal that's holding the port.** This is the single most common cause of `arduino-cli upload` failures during bench iteration. The 1200-baud touch needs to *open the port itself* — if anything else has it (Arduino IDE 2's Serial Monitor, `screen`, `minicom`, `cu`, `picocom`, a stray `cat`), the touch silently fails, the device never enters bootloader, and bossac then fails with `Set binary mode / No device found / Failed to open port at 1200bps`. The IDE's own upload sidesteps this because it auto-closes its monitor first; `arduino-cli` doesn't have that hook.
->
-> Quick check: `lsof /dev/ttyACM0` (empty output = free). Or run [`scripts/preflight.sh`](scripts/preflight.sh) — it'll name the offending process.
+**Recommended:** `scripts/flash.sh <sketch_dir>` (compiles + uploads with state detection and bounded retries — see the canonical iterate-loop section above).
+
+For a raw upload command:
 
 ```bash
 arduino-cli upload --fqbn ClearCore:sam:clearcore -p /dev/ttyACM0 /path/to/MySketch
 ```
+
+> ⚠️ **Before every raw upload: close any Serial Monitor / terminal that's holding the port.** This is the single most common cause of `arduino-cli upload` failures during bench iteration. The 1200-baud touch needs to *open the port itself* — if anything else has it (Arduino IDE 2's Serial Monitor, `screen`, `minicom`, `cu`, `picocom`, a stray `cat`), the touch silently fails, the device never enters bootloader, and bossac then fails with `Set binary mode / No device found / Failed to open port at 1200bps`. The IDE's own upload sidesteps this because it auto-closes its monitor first; `arduino-cli` doesn't. `flash.sh` runs the preflight automatically.
+>
+> Manual check: `lsof /dev/ttyACM0` (empty output = free). Or run [`scripts/preflight.sh`](scripts/preflight.sh) — it'll name the offending process.
 
 What happens under the hood (with `--verbose`):
 
@@ -296,6 +298,8 @@ You should see `ATSAMD51x18/19/20` and `FAMILY_SAMD51` — the SAME53 family is 
 
 ## Files in this repo
 
+- `scripts/flash.sh` — recommended one-shot compile-and-upload wrapper. Detects device state, manages timing, retries safely. Use this for every flash unless you have a reason not to.
+- `scripts/preflight.sh` — checks that `/dev/ttyACM0` (or `$1`) isn't held by another process. Called automatically by `flash.sh`; safe to invoke standalone for diagnosis.
 - `examples/BlinkLED/` — minimal sketch toggling `LED_BUILTIN` (the on-board USR LED). Use as a smoke test.
 - `scripts/install-toolchain.sh` — runs all the steps above. Idempotent.
 - `udev/99-teknic-clearcore.rules` — the udev rule referenced in step 4c.

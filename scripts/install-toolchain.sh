@@ -102,10 +102,9 @@ fi
 
 log "Done."
 echo
-echo "Smoke test:"
-echo "  $REPO_ROOT/scripts/preflight.sh"
-echo "  arduino-cli compile --fqbn ClearCore:sam:clearcore $REPO_ROOT/examples/BlinkLED"
-echo "  arduino-cli upload  --fqbn ClearCore:sam:clearcore -p /dev/ttyACM0 $REPO_ROOT/examples/BlinkLED"
+echo "Smoke test (recommended):"
+echo "  $REPO_ROOT/scripts/flash.sh $REPO_ROOT/examples/BlinkLED"
 echo
-echo "Tip: chain with && so a failed preflight aborts the upload:"
-echo "  $REPO_ROOT/scripts/preflight.sh && arduino-cli compile … && arduino-cli upload …"
+echo "flash.sh wraps preflight + compile + a state-aware bossac upload"
+echo "with bounded retries. The on-board USR LED should blink at 1 Hz"
+echo "after a successful flash."
