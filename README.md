@@ -236,6 +236,7 @@ Total time for a 137 KB sketch: ~3 seconds.
 | Symptom | Probable cause | Fix |
 |---|---|---|
 | `Set binary mode` then `No device found on ttyACM0` | **ModemManager** grabbed the port during bootloader re-enumeration | `sudo systemctl mask --now ModemManager` (step 4b) |
+| `No upload port found, using /dev/ttyACM0 as fallback` followed by `Failed to open port at 1200bps`, device stays at PID `8022` | Another process holds `/dev/ttyACM0`, so the 1200-bps touch never reaches the firmware. **Most common offender: the Arduino IDE's Serial Monitor.** Also `screen`, `minicom`, `cu`, `picocom`, or a `cat` left running. | Close the Serial Monitor (or whatever has the port), then retry. Diagnose with `sudo fuser -v /dev/ttyACM0` or `sudo lsof /dev/ttyACM0`. |
 | `Failed to open port at 1200bps` | User not in `dialout`, or perm race after re-enum | Step 4a (relog into `dialout`) and/or 4c (udev rule) |
 | `No upload port found, using /dev/ttyACM0 as fallback` | Bootloader entered but the kernel hasn't created a new tty yet | Usually benign — bossac retries. If persistent, increase the bootloader-wait timeout or use the udev rule. |
 | `arduino-cli board list` shows `No boards found` after a failed upload | Device stuck in bootloader (PID `0022`) | Power-cycle the ClearCore. The bootloader doesn't time out on its own. |
