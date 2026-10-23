@@ -98,6 +98,25 @@ if [[ "$(uname)" == "Linux" ]]; then
     else
         warn "udev rule not found at $UDEV_SRC — skipping"
     fi
+
+    # 4d. flash.sh / preflight.sh dependencies (stty comes with coreutils)
+    MISSING_PKGS=()
+    command -v lsusb &> /dev/null || MISSING_PKGS+=(usbutils)
+    command -v lsof  &> /dev/null || MISSING_PKGS+=(lsof)
+    if [[ ${#MISSING_PKGS[@]} -eq 0 ]]; then
+        ok "flash.sh dependencies (lsusb, lsof, stty) present"
+    elif command -v apt-get &> /dev/null; then
+        log "Installing ${MISSING_PKGS[*]} (sudo) — needed by flash.sh"
+        sudo apt-get install -y "${MISSING_PKGS[@]}"
+    else
+        warn "Install ${MISSING_PKGS[*]} with your package manager — flash.sh needs them"
+    fi
+
+    # 4e. WSL2: USB is not visible until usbipd-win attaches it
+    if grep -qi microsoft /proc/version 2>/dev/null; then
+        warn "WSL2 detected: attach the ClearCore with usbipd-win before flashing."
+        warn "See 'WSL2' in the README — the bootloader re-enumerates with a new USB ID and must be attached too."
+    fi
 fi
 
 log "Done."

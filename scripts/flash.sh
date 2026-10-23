@@ -17,8 +17,9 @@
 #       2890:0022 = bootloader waiting
 #       (none)    = unplugged → bail with clear message
 #   4. If in app mode: trigger bootloader entry ourselves with a
-#      controlled 1200-baud touch (Python's pyserial), then poll for
-#      the bootloader USB descriptor and let CDC settle
+#      controlled 1200-baud touch (stty: set 1200 baud, drop DTR on
+#      close), then poll for the bootloader USB descriptor and let
+#      CDC settle
 #   5. Call bossac directly — no -a flag (no second touch — that's
 #      what races against the freshly-enumerated CDC and produces
 #      "Set binary mode / No device found")
@@ -26,10 +27,16 @@
 #      no timeout; it patiently waits, so retry is safe and converges
 #   7. Verify the device returns to PID 8022 (running new firmware)
 #
+# Requires: arduino-cli, lsusb (usbutils), stty (coreutils), lsof.
+# scripts/install-toolchain.sh installs them.
+#
+# Timeouts can be raised for slow re-enumeration (e.g. WSL + usbipd):
+#   CC_BL_POLL_TIMEOUT=20 CC_APP_RETURN_TIMEOUT=20 flash.sh <sketch_dir>
+#
 # Exit codes:
 #   0  success
-#   1  preflight / compile failure
-#   2  device not detected
+#   1  preflight / compile / missing-dependency failure
+#   2  device not detected (or more than one ClearCore connected)
 #   3  bootloader entry failed
 #   4  bossac flash failed after retries
 #   5  device didn't return to app mode after flash
@@ -44,10 +51,11 @@ PORT_NAME="$(basename "$PORT")"
 FQBN="ClearCore:sam:clearcore"
 OFFSET="0x4000"
 BUILD_DIR="${TMPDIR:-/tmp}/cc-flash-build"
+BOSSAC_LOG="${TMPDIR:-/tmp}/cc-flash-bossac.log"
 BOSSAC_RETRIES=3
 BOSSAC_RETRY_DELAY=2
-BL_POLL_TIMEOUT=10
-APP_RETURN_TIMEOUT=10
+BL_POLL_TIMEOUT="${CC_BL_POLL_TIMEOUT:-10}"
+APP_RETURN_TIMEOUT="${CC_APP_RETURN_TIMEOUT:-10}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
 
@@ -65,9 +73,26 @@ log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m==> OK:\033[0m %s\n' "$*"; }
 err()  { printf '\033[1;31m==> ERR:\033[0m %s\n' "$*" >&2; }
 
+require_cmd() {
+    # require_cmd <command> <package that provides it>
+    if ! command -v "$1" &> /dev/null; then
+        err "'$1' not found — install $2 (scripts/install-toolchain.sh does this)"
+        exit 1
+    fi
+}
+
+cc_count() {
+    # Number of ClearCores on USB (app or bootloader mode)
+    lsusb 2>/dev/null | grep -c ' 2890:' || true
+}
+
 cc_pid() {
     # Returns the ClearCore's current USB PID (8022 app, 0022 boot, empty if unplugged)
-    lsusb 2>/dev/null | awk '/2890:/ { split($6, a, ":"); print a[2]; exit }'
+    lsusb 2>/dev/null | awk '/ 2890:/ { split($6, a, ":"); print a[2]; exit }'
+}
+
+is_wsl() {
+    grep -qi microsoft /proc/version 2>/dev/null
 }
 
 find_bossac() {
@@ -83,15 +108,14 @@ find_bossac() {
 
 trigger_bootloader() {
     log "Triggering bootloader (1200-baud touch on $PORT)..."
-    python3 - <<PYEOF || true
-import serial, time
-try:
-    s = serial.Serial("$PORT", 1200)
-    time.sleep(0.2)
-    s.close()
-except Exception:
-    pass
-PYEOF
+    # The firmware reboots to the bootloader when DTR drops while the
+    # line rate is 1200 (libClearCore UsbManager::CBLineStateChanged).
+    # stty opens the port (DTR up), sets 1200 baud, and closes it —
+    # with hupcl set, the close drops DTR.
+    if ! stty -F "$PORT" 1200 hupcl 2>/dev/null; then
+        err "Could not open $PORT at 1200 baud (permissions? see 'dialout' in the README)"
+        return 1
+    fi
 
     local i
     for i in $(seq 1 $((BL_POLL_TIMEOUT * 5))); do
@@ -119,15 +143,19 @@ flash_with_bossac() {
         # already and a second touch on an already-bootloader device
         # races against the CDC re-enumeration, producing the classic
         # "Set binary mode / No device found" failure).
-        if "$bossac" -i -d --port="$PORT_NAME" -U -e -w -v --offset="$OFFSET" "$bin" -R 2>&1 | tee /tmp/cc-flash-bossac.log | grep -q "Verify successful"; then
-            return 0
-        fi
-        if grep -q "Verify successful" /tmp/cc-flash-bossac.log; then
+        #
+        # Run bossac to completion and check its log afterwards. Piping
+        # it into `grep -q` would close the pipe at the first match and
+        # could kill bossac (SIGPIPE) before its -R reset, leaving the
+        # device in the bootloader.
+        "$bossac" -i -d --port="$PORT_NAME" -U -e -w -v --offset="$OFFSET" "$bin" -R \
+            > "$BOSSAC_LOG" 2>&1 || true
+        if grep -q "Verify successful" "$BOSSAC_LOG"; then
             return 0
         fi
     done
     err "bossac failed after $BOSSAC_RETRIES attempts. Last 15 lines of bossac output:"
-    tail -15 /tmp/cc-flash-bossac.log >&2
+    tail -15 "$BOSSAC_LOG" >&2
     return 1
 }
 
@@ -144,6 +172,11 @@ wait_for_app_mode() {
 }
 
 # -------- run --------
+
+require_cmd arduino-cli "arduino-cli"
+require_cmd lsusb "usbutils"
+require_cmd stty "coreutils"
+require_cmd lsof "lsof"
 
 # Step 1: preflight
 "${SCRIPT_DIR}/preflight.sh" "$PORT" || exit 1
@@ -170,6 +203,11 @@ log "Using bossac: $BOSSAC"
 log "Binary: $BIN ($(stat -c%s "$BIN") bytes)"
 
 # Step 3: determine device state
+if [[ "$(cc_count)" -gt 1 ]]; then
+    err "More than one ClearCore is connected. Unplug all but the one on $PORT and retry."
+    exit 2
+fi
+
 case "$(cc_pid)" in
     8022)
         # App mode → trigger bootloader
@@ -181,6 +219,9 @@ case "$(cc_pid)" in
         ;;
     "")
         err "ClearCore not detected on USB. Plug in the cable and retry."
+        if is_wsl; then
+            err "On WSL the device must be attached with usbipd-win — see 'WSL2' in the README."
+        fi
         exit 2
         ;;
     *)

@@ -10,13 +10,21 @@
 #
 # Exit codes:
 #   0 — port is free, safe to upload
-#   1 — port is held by another process (printed to stderr)
+#   1 — port is held by another process (printed to stderr), or lsof
+#       is not installed
 #   2 — port does not exist (device unplugged?)
 # ----------------------------------------------------------------------
 
 set -euo pipefail
 
 PORT="${1:-/dev/ttyACM0}"
+
+if ! command -v lsof &> /dev/null; then
+    # Without lsof we cannot tell whether the port is free, and an
+    # empty result would wrongly look like "free".
+    echo "preflight: 'lsof' not found — install it (scripts/install-toolchain.sh does this)" >&2
+    exit 1
+fi
 
 if [[ ! -e "$PORT" ]]; then
     echo "preflight: $PORT does not exist (device unplugged?)" >&2

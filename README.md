@@ -25,7 +25,7 @@ Both are documented below with the exact symptoms.
 | USB PID — application | `8022` |
 | USB PID — bootloader | `0022` |
 | Bootloader interfaces | CDC ACM (SAM-BA), USB Mass Storage (UF2-style), HID |
-| Programming | USB-C on the front, exposes as `/dev/ttyACM*` |
+| Programming | USB type-B on the front (A-to-B cable), exposes as `/dev/ttyACM*` |
 
 The bootloader is reached via the **1200-baud touch reset** — open `/dev/ttyACM0` at 1200 baud and close it; the running firmware sees the magic baud and reboots into the bootloader, which re-enumerates as PID `0022`. `arduino-cli upload` and the Arduino IDE handle this automatically; the rest of this guide assumes it.
 
@@ -129,7 +129,13 @@ sudo udevadm control --reload-rules
 sudo udevadm trigger
 ```
 
-**4d.** *Skip this unless you also want the IDE.* The Arduino IDE 2.x AppImage needs `libfuse2` on Ubuntu 24+:
+**4d. Install the tools `flash.sh` uses** — `lsusb` (to read the device's USB ID) and `lsof` (to check nothing holds the port). `stty` comes with coreutils.
+
+```bash
+sudo apt install -y usbutils lsof
+```
+
+**4e.** *Skip this unless you also want the IDE.* The Arduino IDE 2.x AppImage needs `libfuse2` on Ubuntu 24+:
 
 ```bash
 sudo apt install -y libfuse2t64    # or libfuse2 on older Ubuntu
@@ -156,10 +162,12 @@ scripts/flash.sh <sketch_dir>
 - Runs `preflight.sh` first
 - Compiles to a clean output dir with `arduino-cli compile`
 - Detects current device state (PID `8022` app, `0022` bootloader, or absent)
-- If in app mode: triggers bootloader entry with a controlled 1200-baud touch via `pyserial`, polls for the bootloader USB descriptor, and gives CDC an extra 1 s settle window — what the IDE does implicitly
+- If in app mode: triggers bootloader entry with a controlled 1200-baud touch via `stty` (set 1200 baud, drop DTR on close — what the firmware listens for), polls for the bootloader USB descriptor, and gives CDC an extra 1 s settle window — what the IDE does implicitly
 - If already in bootloader: skips the touch entirely (re-touching a device already in BL is what produces the classic `Set binary mode / No device found` failure)
 - Calls `bossac` directly **without `-a`** — no double-touch race
 - Retries `bossac` up to 3 times with 2 s backoff (the bootloader has no timeout, so retry converges instead of getting stuck)
+- Lets `bossac` run to completion and checks its log afterwards, so it is never cut off before its final reset
+- Refuses to run with more than one ClearCore connected (it can't tell which one is on the port)
 - Verifies the device returns to PID `8022` running the new firmware
 
 If you need the lower-level commands (e.g., to integrate into a different build system), the raw arduino-cli flow still works:
@@ -171,6 +179,44 @@ arduino-cli upload  --fqbn ClearCore:sam:clearcore -p /dev/ttyACM0 <sketch_dir>
 ```
 
 …but be aware the raw `arduino-cli upload` can occasionally race the CDC re-enumeration and leave the device in a stuck-bootloader state that needs a power-cycle to clear. `flash.sh` exists specifically to avoid that.
+
+---
+
+## WSL2 (Windows Subsystem for Linux)
+
+WSL2 does not see USB devices by default. Use [usbipd-win](https://github.com/dorssel/usbipd-win) to pass the ClearCore through, then follow the Linux steps above (ModemManager is normally absent under WSL; the udev rule works when systemd is enabled, the default on current Ubuntu WSL images).
+
+The catch: entering the bootloader makes the ClearCore **re-enumerate with a different USB ID** (`2890:8022` → `2890:0022`), and again on the way back. To WSL that is a device unplugging and a new one appearing, so both IDs must be shared and re-attached automatically.
+
+**1. Install usbipd-win** (Windows, once):
+
+```powershell
+winget install usbipd
+```
+
+**2. Share both modes of the device** (PowerShell **as Administrator**, once per USB port):
+
+```powershell
+usbipd list                        # note the BUSID of 2890:8022 (e.g. 2-3)
+usbipd bind --busid <BUSID>
+# Double-tap RESET on the ClearCore to enter the bootloader, then:
+usbipd list                        # 2890:0022 on the same BUSID
+usbipd bind --busid <BUSID>        # only if it shows "Not shared"
+```
+
+**3. Attach with auto-attach** (normal PowerShell; leave it running while you work):
+
+```powershell
+usbipd attach --wsl --busid <BUSID> --auto-attach
+```
+
+`--auto-attach` re-attaches whatever appears on that port, so the bootloader and the restarted application both reach WSL without manual steps.
+
+**4. Flash as usual** from WSL. Re-attaching adds a second or two to each mode switch; if `flash.sh` times out waiting for the bootloader or the application, raise its timeouts:
+
+```bash
+CC_BL_POLL_TIMEOUT=20 CC_APP_RETURN_TIMEOUT=20 scripts/flash.sh <sketch_dir>
+```
 
 ---
 
@@ -279,6 +325,11 @@ Total time for a 137 KB sketch: ~3 seconds.
 | `mount /dev/sdc` hangs | Same root cause — udev hasn't released the device | Same — udev rule. As a one-off: `sudo kill -9 $(sudo fuser /dev/sdc)` |
 | Upload starts, hangs at `Erase flash` for >5 s | USB cable or hub flake. SAM-BA traffic at 921600 is sensitive to bad cables. | Try a different cable, plug directly into a host port (skip hubs) |
 | `Invalid FQBN: board ClearCore:sam:ClearCore not found` | Capital `C` in the board ID | Use `ClearCore:sam:clearcore` (lowercase board) |
+| `flash.sh`: `'lsusb' not found` or `'lsof' not found` | Missing `usbutils` / `lsof` | `sudo apt install -y usbutils lsof` (step 4d), or re-run `install-toolchain.sh` |
+| `flash.sh`: `More than one ClearCore is connected` | Two or more ClearCores on USB; the script can't tell which is on the port | Unplug all but the one you're flashing |
+| WSL: `ClearCore not detected on USB` | The device isn't attached to WSL | `usbipd attach --wsl --busid <BUSID> --auto-attach` (see WSL2) |
+| WSL: times out waiting for bootloader (PID `0022`) or for the return to PID `8022` | The new USB ID isn't shared, or re-attach is slow | Bind the bootloader mode too (WSL2 step 2); raise `CC_BL_POLL_TIMEOUT` / `CC_APP_RETURN_TIMEOUT` |
+| Device resets during upload; bossac fails partway, then the app is running again | Firmware set the watchdog to Always-On (e.g. [ClearCoreWatchdog](https://github.com/RobotBuzzard/ClearCoreWatchdog) `enableAlwaysOn()`). It keeps running in the bootloader, and a power cycle alone doesn't help — the app boots and sets it again | Use a period of 8 s or more so the upload (~4 s with `flash.sh`) fits inside it, and retry. For short periods the firmware needs a maintenance escape (see the ClearCoreWatchdog README, Always-On mode) |
 
 If a fresh upload fails and the device is stuck in bootloader mode, you can also flash via the **UF2 mass-storage path** as a fallback — but with the udev rule in place, the bossac path is more reliable. UF2 details deliberately omitted here to keep the canonical path simple.
 
@@ -298,7 +349,7 @@ You should see `ATSAMD51x18/19/20` and `FAMILY_SAMD51` — the SAME53 family is 
 
 ## Files in this repo
 
-- `scripts/flash.sh` — recommended one-shot compile-and-upload wrapper. Detects device state, manages timing, retries safely. Use this for every flash unless you have a reason not to.
+- `scripts/flash.sh` — recommended one-shot compile-and-upload wrapper. Detects device state, manages timing, retries safely. Use this for every flash unless you have a reason not to. Needs `arduino-cli`, `lsusb`, `lsof` and `stty`.
 - `scripts/preflight.sh` — checks that `/dev/ttyACM0` (or `$1`) isn't held by another process. Called automatically by `flash.sh`; safe to invoke standalone for diagnosis.
 - `examples/BlinkLED/` — minimal sketch toggling `LED_BUILTIN` (the on-board USR LED). Use as a smoke test.
 - `scripts/install-toolchain.sh` — runs all the steps above. Idempotent.
