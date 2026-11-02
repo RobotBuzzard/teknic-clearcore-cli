@@ -64,7 +64,7 @@ case "$vid:$pid" in
 esac
 
 if [[ ! -r "$PORT" || ! -w "$PORT" ]]; then
-    echo "boot-app: no permission to open $PORT; join 'dialout' and open a new terminal (README step 4a)" >&2
+    echo "boot-app: no permission to open $PORT; add yourself to 'dialout' (README step 4a)" >&2
     exit 1
 fi
 

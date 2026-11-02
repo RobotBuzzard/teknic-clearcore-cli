@@ -40,7 +40,7 @@
 # scripts/install-toolchain.sh installs them. Linux only (WSL2 works).
 #
 # Timeouts can be raised for slow re-enumeration (e.g. WSL + usbipd):
-#   CC_BL_POLL_TIMEOUT=20 CC_APP_RETURN_TIMEOUT=30 flash.sh <sketch_dir>
+#   CC_BL_POLL_TIMEOUT=20 CC_APP_RETURN_TIMEOUT=20 flash.sh <sketch_dir>
 #
 # Exit codes:
 #   0  success
@@ -194,10 +194,7 @@ check_port_access() {
     # Without read/write access the 1200-baud touch and bossac fail with
     # misleading messages ("No device found"), so say it plainly.
     if [[ -e "$PORT" && ( ! -r "$PORT" || ! -w "$PORT" ) ]]; then
-        err "No permission to open $PORT ($(stat -c '%U:%G %a' "$PORT" 2>/dev/null))."
-        err "Join the 'dialout' group and open a NEW terminal: groups are read at login, so"
-        err "shells that were already open (and anything started from them) keep the old ones."
-        err "Check with: id -nG | grep -w dialout   (README step 4a)"
+        err "No permission to open $PORT; add yourself to the 'dialout' group (README step 4a)."
         exit 1
     fi
 }
@@ -289,11 +286,9 @@ if ! wait_for_app_mode; then
         err "Device is still in the bootloader. The new firmware is written and verified;"
         err "start it with scripts/boot-app.sh, or power-cycle the ClearCore."
     elif [[ -z "$pid" ]] && is_wsl; then
-        err "The ClearCore left the bootloader but isn't visible in WSL. The new firmware is most"
-        err "likely running and application mode (2890:8022) isn't reaching WSL. Check that it's"
-        err "shared (usbipd bind --busid <BUSID> in an Administrator PowerShell, while it's"
-        err "running) and that 'usbipd attach --wsl --busid <BUSID> --auto-attach' is still running."
-        err "See 'WSL2' in the README."
+        err "The ClearCore left the bootloader but isn't visible in WSL; the new firmware is most"
+        err "likely running. Check that application mode (2890:8022) is shared and attached"
+        err "(see 'WSL2' in the README)."
     else
         err "Device didn't return to PID 8022 after flash (USB PID now: ${pid:-none}). Bossac"
         err "reported success, but the device may not be running the new firmware."
