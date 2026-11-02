@@ -72,7 +72,7 @@ if [[ "$(uname)" == "Linux" ]]; then
     else
         log "Adding $USER to dialout group (sudo)"
         sudo usermod -aG dialout "$USER"
-        warn "Log out and back in (or run 'newgrp dialout') for dialout to take effect"
+        warn "Log out and back in (on WSL: open a new terminal) for dialout to take effect; check with: id -nG | grep -w dialout"
     fi
 
     # 4b. ModemManager

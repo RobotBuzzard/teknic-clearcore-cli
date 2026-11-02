@@ -22,24 +22,35 @@
 #      CDC settle
 #   5. Call bossac directly — no -a flag (no second touch — that's
 #      what races against the freshly-enumerated CDC and produces
-#      "Set binary mode / No device found")
-#   6. Retry bossac up to N times with backoff. The bootloader has
-#      no timeout; it patiently waits, so retry is safe and converges
-#   7. Verify the device returns to PID 8022 (running new firmware)
+#      "Set binary mode / No device found") and no -R (see 6).
+#      Retry it up to N times with backoff: a bootloader entered on
+#      purpose (1200-baud touch, double-tap) has no timeout; it
+#      patiently waits, so retry is safe and converges
+#   6. Start the application with boot-app.sh instead of bossac's -R.
+#      After a plain reset the bootloader waits a moment for a second
+#      reset (its double-tap detection) before starting the
+#      application; boot-app.sh writes the bootloader's own "start the
+#      application now" word first, so it starts at once. See "How the
+#      bootloader decides" in the README
+#   7. Verify the device returns to PID 8022 (running new firmware).
+#      If it is still in the bootloader, send the start command again:
+#      that's safe to repeat
 #
 # Requires: arduino-cli, lsusb (usbutils), stty (coreutils), lsof.
-# scripts/install-toolchain.sh installs them.
+# scripts/install-toolchain.sh installs them. Linux only (WSL2 works).
 #
 # Timeouts can be raised for slow re-enumeration (e.g. WSL + usbipd):
-#   CC_BL_POLL_TIMEOUT=20 CC_APP_RETURN_TIMEOUT=20 flash.sh <sketch_dir>
+#   CC_BL_POLL_TIMEOUT=20 CC_APP_RETURN_TIMEOUT=30 flash.sh <sketch_dir>
 #
 # Exit codes:
 #   0  success
-#   1  preflight / compile / missing-dependency failure
+#   1  preflight / compile / missing-dependency failure, or no
+#      permission to open the port (see 'dialout' in the README)
 #   2  device not detected (or more than one ClearCore connected)
 #   3  bootloader entry failed
 #   4  bossac flash failed after retries
-#   5  device didn't return to app mode after flash
+#   5  device didn't return to app mode after flash (on WSL: is app
+#      mode, 2890:8022, shared with usbipd?)
 # ----------------------------------------------------------------------
 
 set -euo pipefail
@@ -144,11 +155,12 @@ flash_with_bossac() {
         # races against the CDC re-enumeration, producing the classic
         # "Set binary mode / No device found" failure).
         #
-        # Run bossac to completion and check its log afterwards. Piping
-        # it into `grep -q` would close the pipe at the first match and
-        # could kill bossac (SIGPIPE) before its -R reset, leaving the
-        # device in the bootloader.
-        "$bossac" -i -d --port="$PORT_NAME" -U -e -w -v --offset="$OFFSET" "$bin" -R \
+        # No -R either: step 6 starts the application without the
+        # bootloader's double-tap wait.
+        #
+        # Run bossac to completion and check its log afterwards; the
+        # last lines are shown if it fails.
+        "$bossac" -i -d --port="$PORT_NAME" -U -e -w -v --offset="$OFFSET" "$bin" \
             > "$BOSSAC_LOG" 2>&1 || true
         if grep -q "Verify successful" "$BOSSAC_LOG"; then
             return 0
@@ -157,6 +169,13 @@ flash_with_bossac() {
     err "bossac failed after $BOSSAC_RETRIES attempts. Last 15 lines of bossac output:"
     tail -15 "$BOSSAC_LOG" >&2
     return 1
+}
+
+boot_app() {
+    # Leave the bootloader into the new application at once, without
+    # the double-tap wait (see scripts/boot-app.sh).
+    sleep 0.5   # let bossac's close settle before reopening the port
+    "${SCRIPT_DIR}/boot-app.sh" "$PORT"
 }
 
 wait_for_app_mode() {
@@ -171,6 +190,18 @@ wait_for_app_mode() {
     return 1
 }
 
+check_port_access() {
+    # Without read/write access the 1200-baud touch and bossac fail with
+    # misleading messages ("No device found"), so say it plainly.
+    if [[ -e "$PORT" && ( ! -r "$PORT" || ! -w "$PORT" ) ]]; then
+        err "No permission to open $PORT ($(stat -c '%U:%G %a' "$PORT" 2>/dev/null))."
+        err "Join the 'dialout' group and open a NEW terminal: groups are read at login, so"
+        err "shells that were already open (and anything started from them) keep the old ones."
+        err "Check with: id -nG | grep -w dialout   (README step 4a)"
+        exit 1
+    fi
+}
+
 # -------- run --------
 
 require_cmd arduino-cli "arduino-cli"
@@ -178,8 +209,13 @@ require_cmd lsusb "usbutils"
 require_cmd stty "coreutils"
 require_cmd lsof "lsof"
 
-# Step 1: preflight
-"${SCRIPT_DIR}/preflight.sh" "$PORT" || exit 1
+# Step 1: preflight. A missing port (preflight exit 2) isn't fatal here:
+# step 3 reports a missing device, with the usbipd hint on WSL.
+preflight_rc=0
+"${SCRIPT_DIR}/preflight.sh" "$PORT" || preflight_rc=$?
+if [[ $preflight_rc -ne 0 && $preflight_rc -ne 2 ]]; then
+    exit 1
+fi
 
 # Step 2: compile
 log "Compiling $SKETCH..."
@@ -202,11 +238,12 @@ BOSSAC="$(find_bossac)"
 log "Using bossac: $BOSSAC"
 log "Binary: $BIN ($(stat -c%s "$BIN") bytes)"
 
-# Step 3: determine device state
+# Steps 3-4: determine device state; enter the bootloader if needed
 if [[ "$(cc_count)" -gt 1 ]]; then
     err "More than one ClearCore is connected. Unplug all but the one on $PORT and retry."
     exit 2
 fi
+check_port_access
 
 case "$(cc_pid)" in
     8022)
@@ -230,14 +267,38 @@ case "$(cc_pid)" in
         ;;
 esac
 
-# Step 4: flash
+# Step 5: flash
 flash_with_bossac "$BOSSAC" "$BIN" || exit 4
 
-# Step 5: verify
+# Step 6: start the application at once (no double-tap wait). If this
+# fails, step 7 still checks where the board is and tries again.
+log "Starting the application..."
+boot_app || err "The start command didn't go through; checking the device..."
+
+# Step 7: verify
 log "Waiting for device to return to application mode..."
-wait_for_app_mode || {
-    err "Device didn't return to PID 8022 after flash. Bossac reported success but device may not be running new firmware."
+if ! wait_for_app_mode; then
+    pid="$(cc_pid)"
+    if [[ "$pid" == "0022" && -c "$PORT" ]]; then
+        # Still in the bootloader. Sending the start command again is safe.
+        log "Still in the bootloader — sending the start command again..."
+        if boot_app && wait_for_app_mode; then
+            ok "Flash complete."
+            exit 0
+        fi
+        err "Device is still in the bootloader. The new firmware is written and verified;"
+        err "start it with scripts/boot-app.sh, or power-cycle the ClearCore."
+    elif [[ -z "$pid" ]] && is_wsl; then
+        err "The ClearCore left the bootloader but isn't visible in WSL. The new firmware is most"
+        err "likely running and application mode (2890:8022) isn't reaching WSL. Check that it's"
+        err "shared (usbipd bind --busid <BUSID> in an Administrator PowerShell, while it's"
+        err "running) and that 'usbipd attach --wsl --busid <BUSID> --auto-attach' is still running."
+        err "See 'WSL2' in the README."
+    else
+        err "Device didn't return to PID 8022 after flash (USB PID now: ${pid:-none}). Bossac"
+        err "reported success, but the device may not be running the new firmware."
+    fi
     exit 5
-}
+fi
 
 ok "Flash complete."

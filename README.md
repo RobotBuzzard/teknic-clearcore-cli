@@ -97,9 +97,15 @@ The FQBN is **`ClearCore:sam:clearcore`** (board ID is lowercase even though Tek
 
 ```bash
 sudo usermod -aG dialout $USER
-# Log out and back in, OR start a new login shell:
-newgrp dialout
 ```
+
+Group membership is read at login, so it only applies to **new login sessions**: shells already open — and anything started from them, such as an editor — keep the old groups. Log out and back in (on WSL, opening a new terminal window is enough) and check:
+
+```bash
+id -nG | grep -w dialout
+```
+
+(`newgrp dialout` also works where it's installed; it wasn't on our Ubuntu 26.04 WSL install.) `flash.sh` checks the port's permissions and tells you if this is the problem.
 
 **4b. Mask ModemManager.** This is the single most likely cause of `arduino-cli upload` failing on Ubuntu/Debian. ModemManager probes every new `tty` device with AT commands the moment it appears. The bootloader's CDC interface comes up *briefly* after the 1200-baud touch, ModemManager grabs it, bossac can't negotiate the SAM-BA chip-ID handshake, and you get:
 
@@ -157,18 +163,20 @@ The on-board USR LED should blink at 1 Hz. If it does, the toolchain is good.
 scripts/flash.sh <sketch_dir>
 ```
 
-[`scripts/flash.sh`](scripts/flash.sh) wraps preflight + compile + a state-aware upload that's matched the Arduino IDE 2's reliability across stress tests on this bench (3-for-3 back-to-back flashes, no stuck-bootloader recovery needed). It:
+[`scripts/flash.sh`](scripts/flash.sh) wraps preflight + compile + a state-aware upload that brings the board back into the new application without a power cycle (test results under [WSL2](#wsl2-windows-subsystem-for-linux)). It:
 
 - Runs `preflight.sh` first
 - Compiles to a clean output dir with `arduino-cli compile`
 - Detects current device state (PID `8022` app, `0022` bootloader, or absent)
 - If in app mode: triggers bootloader entry with a controlled 1200-baud touch via `stty` (set 1200 baud, drop DTR on close — what the firmware listens for), polls for the bootloader USB descriptor, and gives CDC an extra 1 s settle window — what the IDE does implicitly
-- If already in bootloader: skips the touch entirely (re-touching a device already in BL is what produces the classic `Set binary mode / No device found` failure)
-- Calls `bossac` directly **without `-a`** — no double-touch race
-- Retries `bossac` up to 3 times with 2 s backoff (the bootloader has no timeout, so retry converges instead of getting stuck)
-- Lets `bossac` run to completion and checks its log afterwards, so it is never cut off before its final reset
+- If already in bootloader: skips the touch entirely (an upload that starts with a touch while the device is already in the bootloader is when the classic `Set binary mode / No device found` failure shows up)
+- Checks it can open the port, and says so plainly if not (`dialout`, step 4a)
+- Calls `bossac` directly **without `-a`** — no double-touch race — and **without `-R`** (next point)
+- Starts the new application with [`scripts/boot-app.sh`](scripts/boot-app.sh) instead of bossac's `-R` reset. After a plain reset the bootloader waits a moment for a second reset (its double-tap detection) before starting the application; `boot-app.sh` writes the bootloader's own "start the application now" word first, so the application starts at once. See [How the bootloader decides](#how-the-bootloader-decides)
+- Retries `bossac` up to 3 times with 2 s backoff (a bootloader entered on purpose has no timeout, so retry converges instead of getting stuck)
+- Lets `bossac` run to completion and checks its log afterwards (the last lines are shown if it fails)
 - Refuses to run with more than one ClearCore connected (it can't tell which one is on the port)
-- Verifies the device returns to PID `8022` running the new firmware
+- Verifies the device returns to PID `8022`; if it is still in the bootloader, sends the start command again (safe to repeat). On WSL it tells you when the application isn't reaching WSL
 
 If you need the lower-level commands (e.g., to integrate into a different build system), the raw arduino-cli flow still works:
 
@@ -178,7 +186,7 @@ arduino-cli compile --fqbn ClearCore:sam:clearcore <sketch_dir> && \
 arduino-cli upload  --fqbn ClearCore:sam:clearcore -p /dev/ttyACM0 <sketch_dir>
 ```
 
-…but be aware the raw `arduino-cli upload` can occasionally race the CDC re-enumeration and leave the device in a stuck-bootloader state that needs a power-cycle to clear. `flash.sh` exists specifically to avoid that.
+…but be aware the raw `arduino-cli upload` can occasionally race the CDC re-enumeration and leave the device in a stuck-bootloader state. `flash.sh` exists specifically to avoid that. If a board is ever left in the bootloader with good firmware on it, `scripts/boot-app.sh` starts the application without a power cycle.
 
 ---
 
@@ -194,15 +202,20 @@ The catch: entering the bootloader makes the ClearCore **re-enumerate with a dif
 winget install usbipd
 ```
 
-**2. Share both modes of the device** (PowerShell **as Administrator**, once per USB port):
+Then open a **new** PowerShell window: the one you installed from doesn't have `usbipd` on its `PATH` yet (or call it as `& "C:\Program Files\usbipd-win\usbipd.exe"`).
+
+**2. Share both modes of the device** (PowerShell **as Administrator**, once per USB port). Sharing is per mode — `2890:8022` (application) and `2890:0022` (bootloader) are separate entries to usbipd — so bind whichever mode it's in now, switch modes, and bind again:
 
 ```powershell
-usbipd list                        # note the BUSID of 2890:8022 (e.g. 2-3)
+usbipd list                        # note the BUSID of the 2890:xxxx device (e.g. 2-3)
 usbipd bind --busid <BUSID>
-# Double-tap RESET on the ClearCore to enter the bootloader, then:
-usbipd list                        # 2890:0022 on the same BUSID
+# Switch modes (application → bootloader: double-tap RESET;
+#               bootloader → application: power-cycle the ClearCore), then:
+usbipd list                        # the other 2890:xxxx ID on the same BUSID
 usbipd bind --busid <BUSID>        # only if it shows "Not shared"
 ```
+
+Both are required. If application mode isn't shared, `flash.sh` can't see the board while your application runs: it can't start an upload from there, and after an upload it exits with code 5 because the application never appears in WSL.
 
 **3. Attach with auto-attach** (normal PowerShell; leave it running while you work):
 
@@ -212,11 +225,13 @@ usbipd attach --wsl --busid <BUSID> --auto-attach
 
 `--auto-attach` re-attaches whatever appears on that port, so the bootloader and the restarted application both reach WSL without manual steps.
 
-**4. Flash as usual** from WSL. Re-attaching adds a second or two to each mode switch; if `flash.sh` times out waiting for the bootloader or the application, raise its timeouts:
+**4. Flash as usual** from WSL, in a terminal opened after you joined `dialout` (step 4a). Re-attaching adds a second or more to each mode switch; if `flash.sh` times out waiting for the bootloader or the application, raise its timeouts:
 
 ```bash
-CC_BL_POLL_TIMEOUT=20 CC_APP_RETURN_TIMEOUT=20 scripts/flash.sh <sketch_dir>
+CC_BL_POLL_TIMEOUT=20 CC_APP_RETURN_TIMEOUT=30 scripts/flash.sh <sketch_dir>
 ```
+
+Tested on 2026-11-02 (Windows 11 build 26200, usbipd-win 5.3.0, WSL2 Ubuntu 26.04, UF2 Bootloader v2.3.1-Teknic.4): 12 flashes with `flash.sh` (10 starting from application mode, 1 from a parked bootloader, 1 from a RESET double-tap) all came back in application mode within 1.4 s, and `boot-app.sh` on its own brought a parked bootloader back into the application.
 
 ---
 
@@ -231,11 +246,11 @@ arduino-cli core update-index
 arduino-cli core install ClearCore:sam
 ```
 
-No ModemManager equivalent. No udev. Port is usually `/dev/cu.usbmodem*`. Otherwise identical.
+No ModemManager equivalent. No udev. Port is usually `/dev/cu.usbmodem*`. The `arduino-cli` commands are the same, but the scripts in `scripts/` are Linux-only (they use `lsusb` and GNU `stty -F`), so use the raw `arduino-cli` flow on macOS.
 
 ## Windows
 
-Use Teknic's **ClearCore Arduino Wrapper Installer** (Windows MSI from teknic.com) — it bundles arduino-cli + the platform + the Windows toolchain + Teknic's ClearCore Editor for Atmel/Microchip Studio. Or install `arduino-cli.exe` standalone and run the same commands as Linux. Port is `COMx`.
+Use Teknic's **ClearCore Arduino Wrapper Installer** (Windows MSI from teknic.com) — it bundles arduino-cli + the platform + the Windows toolchain + Teknic's ClearCore Editor for Atmel/Microchip Studio. Or install `arduino-cli.exe` standalone and run the same `arduino-cli` commands as on Linux. Port is `COMx`. The scripts in `scripts/` don't run on Windows itself; to use them from a Windows PC, run them in WSL2 (see [WSL2](#wsl2-windows-subsystem-for-linux)). A board left in the bootloader starts its application again on a power cycle.
 
 ---
 
@@ -293,7 +308,7 @@ arduino-cli upload --fqbn ClearCore:sam:clearcore -p /dev/ttyACM0 /path/to/MySke
 
 What happens under the hood (with `--verbose`):
 
-1. **1200-bps touch reset** on `/dev/ttyACM0` — `arduino-cli` opens the port at 1200 baud, closes it. The application firmware reboots into the bootloader.
+1. **1200-bps touch reset** on `/dev/ttyACM0` — `arduino-cli` opens the port at 1200 baud, closes it. The application firmware writes `0xF01669EF` to the last word of RAM and resets; the bootloader sees that word and stays, with no timeout.
 2. **Wait for upload port** — the bootloader re-enumerates with USB PID `0022`. `/dev/ttyACM0` reappears (kernel often re-uses the same name).
 3. **`bossac`** is invoked:
    ```
@@ -305,9 +320,40 @@ What happens under the hood (with `--verbose`):
    - Writes the binary in 4 KB pages
    - Verifies via per-page checksum
    - Issues `writeWord(0xe000ed0c, 0x5fa0004)` — Cortex-M `AIRCR.SYSRESETREQ`, soft-reset
-4. The new firmware boots, USB re-enumerates back to PID `8022`.
+4. The bootloader runs its double-tap wait ([next section](#how-the-bootloader-decides)), then starts the new application, and USB re-enumerates back to PID `8022`. `flash.sh` replaces this reset with `boot-app.sh`, which skips the wait.
 
 Total time for a 137 KB sketch: ~3 seconds.
+
+---
+
+## How the bootloader decides
+
+The ClearCore's bootloader is **UF2 Bootloader v2.3.1-Teknic.4**, Teknic's fork of Microsoft's [uf2-samdx1](https://github.com/microsoft/uf2-samdx1). (Its SAM-BA monitor reports `v1.1 [Arduino:XYZ] Sep 14 2020`; that's the monitor's version, not the bootloader's.) The copy read off our board with `bossac -r` is byte-identical to `bootloader/bootloader-ClearCore-v2.3.1-Teknic.4.bin` in `ClearCore:sam` 1.7.1, and the `.elf` next to it has symbols, so everything below can be checked with `arm-none-eabi-addr2line -f -e bootloader-ClearCore-v2.3.1-Teknic.4.elf <address>`.
+
+On every reset, `check_start_application()` decides between staying in the bootloader and starting the application, using the reset cause and one word at the end of RAM, `0x2002FFFC`. For an Arduino sketch built with `ClearCore:sam` 1.7.1 it checks, top to bottom:
+
+| Condition | Bootloader action | Checked |
+|---|---|---|
+| No application: the reset vector at `0x4004` is outside `0x4000`–`0x80000` (e.g. erased flash) | Stays in the bootloader | code |
+| Power-on | Clears the word, starts the application | code + bench |
+| The word is `0xF01669EF` (uf2-samdx1's `DBL_TAP_MAGIC`) | Clears it, stays in the bootloader with no timeout | code + bench |
+| The word is `0xF02669EF` (`DBL_TAP_MAGIC_QUICK_BOOT`) | Clears it, starts the application at once | code + bench |
+| Anything else, e.g. bossac's `-R` | Writes `DBL_TAP_MAGIC`, waits a moment (`delay(500)`, not measured), clears it, starts the application. A second reset during that wait finds `DBL_TAP_MAGIC` and stays: this is the RESET double-tap | code + bench |
+
+Who writes the word:
+
+- `DBL_TAP_MAGIC`: the application's 1200-baud touch (libClearCore's `ResetBoard(RESET_TO_BOOTLOADER)` writes it, then resets); the wait in the last row; and the bootloader's own `resetIntoBootloader()`, which it calls among other things when its SAM-BA monitor sees the USB connection drop.
+- `DBL_TAP_MAGIC_QUICK_BOOT`: `boot-app.sh`, and the bootloader's own `resetIntoApp()`, for example after a UF2 file is copied to it.
+
+On the bench (2026-11-02): after a 1200-baud touch and after a RESET double-tap, the word read back as `0` with the board in the bootloader; a plain reset from there started the application; writing `DBL_TAP_MAGIC_QUICK_BOOT` and resetting started it at once; a power cycle started it.
+
+So bossac's `-R` works unless something resets or redirects the board during that short wait. `flash.sh` doesn't rely on it: it ends an upload with `boot-app.sh`, which checks the SAM-BA monitor answers (`N#`, then `V#`), writes `DBL_TAP_MAGIC_QUICK_BOOT` (`W2002FFFC,F02669EF#`) and resets (`WE000ED0C,05FA0004#`), so the application starts with no wait. `flash.sh` then checks the board came back in application mode and sends the start command again if it is still in the bootloader. On its own, `boot-app.sh` gets a board that is sitting in the bootloader with good firmware back into the application without a power cycle.
+
+**Single-reset firmware.** Firmware with the word `0x87EEB07C` at `0x4268` gets uf2-samdx1's single-reset mode (`USE_SINGLE_RESET`) instead. Nothing in `ClearCore:sam` 1.7.1 adds that word, so this is from the code only: on power-on, and on any other reset unless the word is `DBL_TAP_MAGIC_QUICK_BOOT`, the bootloader writes `DBL_TAP_MAGIC_QUICK_BOOT`, brings up USB as `2890:0022` and starts a timeout (300 ticks of a counter driven by its USB polling, not measured; upstream uses 50, commented "around 1.5s"). If the host finishes enumerating it (SET_CONFIGURATION) before the timeout, it stays in the bootloader; otherwise it starts the application. A second reset in the meantime starts the application at once.
+
+**Open question.** The first upload of 2026-11-02, made with bossac's `-R` over WSL after the board had been sitting in the bootloader from an earlier, unknown entry, left a verified board in the bootloader (I/O LEDs streaming; Windows and WSL saw it as `2890:0022`). The rules above leave three candidates, none confirmed: bossac's reset didn't take effect (BOSSA deliberately ignores errors from that write) and the bootloader stayed, or later put itself back when its USB connection dropped; a second reset during the wait; or another program sending the new application a 1200-baud touch. Six later plain resets all started the application. If you see it, run `boot-app.sh` or power-cycle.
+
+Where to look in the bootloader image: `check_start_application()` (inlined into `main()`) at `0x16F4`–`0x1856`, with the application check at `0x16F4`, the single-reset check at `0x1706`, power-on at `0x1714`, `DBL_TAP_MAGIC` at `0x1720`/`0x1824`, `DBL_TAP_MAGIC_QUICK_BOOT` at `0x172A`, the double-tap wait at `0x1734`–`0x174C` and the jump to the application at `0x174E`; single-reset set-up at `0x1840`; `resetIntoApp()` at `0x0724`; `resetIntoBootloader()` at `0x0774`, called from `sam_ba_monitor_run()` at `0x1E6C`; the timeout check in `timerTick()` at `0x0754`; SET_CONFIGURATION in `AT91F_CDC_Enumerate()` at `0x0FD8`; the timeout cleared in `main()` at `0x179E`.
 
 ---
 
@@ -317,10 +363,12 @@ Total time for a 137 KB sketch: ~3 seconds.
 |---|---|---|
 | `Set binary mode` then `No device found on ttyACM0` | **ModemManager** grabbed the port during bootloader re-enumeration | `sudo systemctl mask --now ModemManager` (step 4b) |
 | `No upload port found, using /dev/ttyACM0 as fallback` followed by `Failed to open port at 1200bps`, device stays at PID `8022` | Another process holds `/dev/ttyACM0`, so the 1200-bps touch never reaches the firmware. **Most common offender: the Arduino IDE's Serial Monitor.** Also `screen`, `minicom`, `cu`, `picocom`, or a `cat` left running. **See the warning at the top of the Upload section.** | Close the Serial Monitor (or whatever has the port), then retry. Diagnose with `lsof /dev/ttyACM0` or run `scripts/preflight.sh`. |
-| Device stuck at PID `0022` (bootloader), `arduino-cli upload` fails with `Set binary mode / No device found` even with port free | The 1200-bps touch on a device that's *already* in bootloader briefly resets the bootloader's CDC interface; bossac then tries to talk to a not-yet-ready port. **`arduino-cli`'s `--upload-property use_1200bps_touch=false` does NOT actually skip the touch in v1.4.1 — verified by `--verbose` output.** | Use `scripts/flash.sh` instead — it detects bootloader state and skips the touch when the device is already there. As a last resort, power-cycle the ClearCore. |
-| `Failed to open port at 1200bps` | User not in `dialout`, or perm race after re-enum | Step 4a (relog into `dialout`) and/or 4c (udev rule) |
+| Device stuck at PID `0022` (bootloader), `arduino-cli upload` fails with `Set binary mode / No device found` even with port free | Seen when the device is already in the bootloader as `arduino-cli upload` starts. (Its 1200-bps touch doesn't reach the bootloader, which ignores line-coding and DTR changes, so the exact failure point isn't established.) **`arduino-cli`'s `--upload-property use_1200bps_touch=false` does NOT actually skip the touch in v1.4.1 — verified by `--verbose` output.** | Use `scripts/flash.sh` instead — it detects bootloader state and skips the touch when the device is already there. As a last resort, power-cycle the ClearCore. |
+| `Failed to open port at 1200bps` | User not in `dialout`, or perm race after re-enum | Step 4a (join `dialout`, then a **new** terminal) and/or 4c (udev rule) |
+| `flash.sh`: `No permission to open /dev/ttyACM0` | This terminal (or the tool running `flash.sh`) started before you joined `dialout`, so it doesn't have the group | Open a new terminal and check `id -nG \| grep -w dialout` (step 4a). Don't loosen the udev rule's permissions instead |
+| After an upload the board sits in the bootloader (I/O LEDs streaming, PID `0022`) although bossac said `Verify successful` | Not established. Seen once, with bossac's `-R` over WSL: the reset may not have taken effect, or something reset or redirected the board again ([How the bootloader decides](#how-the-bootloader-decides), open question) | `scripts/boot-app.sh`, or a power cycle. `flash.sh` starts the application with `boot-app.sh` and checks that it came back |
 | `No upload port found, using /dev/ttyACM0 as fallback` | Bootloader entered but the kernel hasn't created a new tty yet | Usually benign — bossac retries. If persistent, increase the bootloader-wait timeout or use the udev rule. |
-| `arduino-cli board list` shows `No boards found` after a failed upload | Device stuck in bootloader (PID `0022`) | Power-cycle the ClearCore. The bootloader doesn't time out on its own. |
+| `arduino-cli board list` shows `No boards found` after a failed upload | Device stuck in bootloader (PID `0022`) | `scripts/boot-app.sh` if the application is intact (otherwise flash again with `flash.sh`), or power-cycle the ClearCore. A bootloader entered on purpose doesn't time out on its own. |
 | Desktop shows "failed to mount, mount in progress" | GNOME/KDE auto-mount is fighting `udev`'s `blkid` probe of the bootloader mass-storage | Step 4c udev rule (`UDISKS_IGNORE=1`) |
 | `mount /dev/sdc` hangs | Same root cause — udev hasn't released the device | Same — udev rule. As a one-off: `sudo kill -9 $(sudo fuser /dev/sdc)` |
 | Upload starts, hangs at `Erase flash` for >5 s | USB cable or hub flake. SAM-BA traffic at 921600 is sensitive to bad cables. | Try a different cable, plug directly into a host port (skip hubs) |
@@ -328,7 +376,8 @@ Total time for a 137 KB sketch: ~3 seconds.
 | `flash.sh`: `'lsusb' not found` or `'lsof' not found` | Missing `usbutils` / `lsof` | `sudo apt install -y usbutils lsof` (step 4d), or re-run `install-toolchain.sh` |
 | `flash.sh`: `More than one ClearCore is connected` | Two or more ClearCores on USB; the script can't tell which is on the port | Unplug all but the one you're flashing |
 | WSL: `ClearCore not detected on USB` | The device isn't attached to WSL | `usbipd attach --wsl --busid <BUSID> --auto-attach` (see WSL2) |
-| WSL: times out waiting for bootloader (PID `0022`) or for the return to PID `8022` | The new USB ID isn't shared, or re-attach is slow | Bind the bootloader mode too (WSL2 step 2); raise `CC_BL_POLL_TIMEOUT` / `CC_APP_RETURN_TIMEOUT` |
+| WSL: times out waiting for bootloader (PID `0022`) | Bootloader mode isn't shared, or re-attach is slow | Bind the bootloader mode (WSL2 step 2); raise `CC_BL_POLL_TIMEOUT` |
+| WSL: `flash.sh` exits 5 after `Verify successful` and says the ClearCore "isn't visible in WSL"; the board shows the new firmware running | Application mode (`2890:8022`) isn't shared, so it never reaches WSL | While it's running, in Administrator PowerShell: `usbipd bind --busid <BUSID>` (WSL2 step 2). If it's only slow, raise `CC_APP_RETURN_TIMEOUT` |
 | Device resets during upload; bossac fails partway, then the app is running again | Firmware set the watchdog to Always-On (e.g. [ClearCoreWatchdog](https://github.com/RobotBuzzard/ClearCoreWatchdog) `enableAlwaysOn()`). It keeps running in the bootloader, and a power cycle alone doesn't help — the app boots and sets it again | Use a period of 8 s or more so the upload (~4 s with `flash.sh`) fits inside it, and retry. For short periods the firmware needs a maintenance escape (see the ClearCoreWatchdog README, Always-On mode) |
 
 If a fresh upload fails and the device is stuck in bootloader mode, you can also flash via the **UF2 mass-storage path** as a fallback — but with the udev rule in place, the bossac path is more reliable. UF2 details deliberately omitted here to keep the canonical path simple.
@@ -351,6 +400,7 @@ You should see `ATSAMD51x18/19/20` and `FAMILY_SAMD51` — the SAME53 family is 
 
 - `scripts/flash.sh` — recommended one-shot compile-and-upload wrapper. Detects device state, manages timing, retries safely. Use this for every flash unless you have a reason not to. Needs `arduino-cli`, `lsusb`, `lsof` and `stty`.
 - `scripts/preflight.sh` — checks that `/dev/ttyACM0` (or `$1`) isn't held by another process. Called automatically by `flash.sh`; safe to invoke standalone for diagnosis.
+- `scripts/boot-app.sh` — starts the application from the bootloader at once, with no double-tap wait (see [How the bootloader decides](#how-the-bootloader-decides)). Called by `flash.sh` after every flash; run it yourself when a board is sitting in the bootloader with good firmware on it. Checks that the port is a ClearCore bootloader that answers before writing anything; a no-op if the application is already running.
 - `examples/BlinkLED/` — minimal sketch toggling `LED_BUILTIN` (the on-board USR LED). Use as a smoke test.
 - `scripts/install-toolchain.sh` — runs all the steps above. Idempotent.
 - `udev/99-teknic-clearcore.rules` — the udev rule referenced in step 4c.
