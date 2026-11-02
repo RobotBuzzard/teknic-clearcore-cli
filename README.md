@@ -408,7 +408,7 @@ You should see `ATSAMD51x18/19/20` and `FAMILY_SAMD51` — the SAME53 family is 
 
 ## Roadmap
 
-- Match the port argument to the board that was detected: `flash.sh` and `boot-app.sh` give a misleading error today when the ClearCore isn't on `/dev/ttyACM0`.
+- Match `flash.sh`'s port argument to the board it detected: today it gives a misleading error when the ClearCore isn't on `/dev/ttyACM0`.
 - Confirm the ModemManager udev tag (`ID_MM_DEVICE_IGNORE`) on a desktop Linux install with ModemManager running, and run `install-toolchain.sh` on a fresh image.
 - Check that the udev rule's mass-storage line (`ID_FS_TYPE_NOT_PROBED`) stops the probe it is meant to stop, or drop it.
 - Test `flash.ps1` and `boot-app.ps1` under PowerShell 7.
