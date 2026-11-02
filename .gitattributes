@@ -1,0 +1,7 @@
+# Normalize line endings so Windows contributors (Git for Windows defaults to
+# core.autocrlf=true) never check out CRLF into files that Linux executes.
+# A CRLF shebang line fails with: /usr/bin/env: 'bash\r': No such file or directory
+* text=auto
+*.sh    text eol=lf
+*.rules text eol=lf
+*.ps1   text eol=crlf

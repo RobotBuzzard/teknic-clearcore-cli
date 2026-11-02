@@ -151,7 +151,7 @@ cd teknic-clearcore-cli
 scripts/flash.sh examples/BlinkLED
 ```
 
-The on-board USR LED should blink at 1 Hz. If it does, the toolchain is good.
+The IO-4 (green) and IO-5 (red) LEDs should fade up and down in turn, then together (amber), about 2 s per sweep. If they do, the toolchain is good. The sketch also prints each phase on USB serial.
 
 **This is the canonical iterate-loop for every sketch on every flash:**
 
@@ -243,7 +243,18 @@ No ModemManager equivalent. No udev. Port is usually `/dev/cu.usbmodem*`. The `a
 
 ## Windows
 
-Use Teknic's **ClearCore Arduino Wrapper Installer** (Windows MSI from teknic.com) — it bundles arduino-cli + the platform + the Windows toolchain + Teknic's ClearCore Editor for Atmel/Microchip Studio. Or install `arduino-cli.exe` standalone and run the same `arduino-cli` commands as on Linux. Port is `COMx`. The scripts in `scripts/` don't run on Windows itself; to use them from a Windows PC, run them in WSL2 (see [WSL2](#wsl2-windows-subsystem-for-linux)). A board left in the bootloader starts its application again on a single RESET press or a power cycle.
+Use Teknic's **ClearCore Arduino Wrapper Installer** (Windows MSI from teknic.com) — it bundles arduino-cli + the platform + the Windows toolchain + Teknic's ClearCore Editor for Atmel/Microchip Studio. Or install `arduino-cli.exe` standalone and run the same `arduino-cli` commands as on Linux. Port is `COMx`; the bootloader (`2890:0022`) usually gets a different COM number from the application (`2890:8022`).
+
+For native Windows (no WSL), `scripts/flash.ps1` and `scripts/boot-app.ps1` are PowerShell ports of `flash.sh` and `boot-app.sh`, with the same steps and exit codes. They need `arduino-cli` (`winget install ArduinoSA.CLI`) and the `ClearCore:sam` core. They find the board's COM ports by USB ID, so no port argument is needed:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\flash.ps1 .\examples\BlinkLED
+powershell -ExecutionPolicy Bypass -File .\scripts\boot-app.ps1      # board left in the bootloader
+```
+
+`flash.ps1` options: `-Port COMx` (the application-mode port, if auto-detect picks the wrong one), `-BootloaderTimeout` and `-AppReturnTimeout` (seconds, default 10), `-Retries`, `-RetryDelay`. A board attached to WSL with usbipd-win is invisible to Windows; both scripts say so and print the `usbipd detach` command. Windows COM ports are exclusive, so a port held by a Serial Monitor shows up as an access-denied error before anything is compiled.
+
+The bash scripts in `scripts/` don't run on Windows itself; to use them from a Windows PC, run them in WSL2 (see [WSL2](#wsl2-windows-subsystem-for-linux)). A board left in the bootloader starts its application again with `boot-app.ps1`, a single RESET press or a power cycle.
 
 ---
 
@@ -382,10 +393,11 @@ You should see `ATSAMD51x18/19/20` and `FAMILY_SAMD51` — the SAME53 family is 
 
 - `scripts/flash.sh` — recommended one-shot compile-and-upload wrapper (`flash.sh <sketch_dir> [port]`, port default `/dev/ttyACM0`). Detects device state, manages timing, retries safely. Use this for every flash unless you have a reason not to. Needs `arduino-cli`, `lsusb`, `lsof` and `stty`.
 - `scripts/boot-app.sh` — starts the application from the bootloader at once, with no double-tap wait (`boot-app.sh [port]`, default `/dev/ttyACM0`; see [How the bootloader decides](#how-the-bootloader-decides)). Called by `flash.sh` after every flash; run it yourself when a board is sitting in the bootloader with good firmware on it. Checks that the port is free and is a ClearCore bootloader that answers before writing anything; a no-op if the application is already running. Exit 0 means the start was requested, not that the application started: if the board is still at PID `0022` a few seconds later (allow longer on WSL), there's no valid application to start; flash it with `flash.sh`.
+- `scripts/flash.ps1`, `scripts/boot-app.ps1` — native Windows (PowerShell 5.1+) ports of `flash.sh` and `boot-app.sh`; see [Windows](#windows).
 - `scripts/preflight.sh` — checks that `/dev/ttyACM0` (or `$1`) isn't held by another process of yours. Called automatically by `flash.sh`; safe to invoke standalone for diagnosis.
 - `scripts/install-toolchain.sh` — runs steps 1–4d above (not the optional IDE step). Idempotent. Run it from a clone.
 - `udev/99-teknic-clearcore.rules` — the udev rule referenced in step 4c.
-- `examples/BlinkLED/` — minimal sketch toggling `LED_BUILTIN` (the on-board USR LED). Use as a smoke test.
+- `examples/BlinkLED/` — minimal sketch that fades the IO-4 (green) and IO-5 (red) LEDs up and down with PWM: IO-4, then IO-5, then both together (amber). The on-board USR LED, which is hard to see inside the unit, toggles at each phase. Use as a smoke test.
 - `docs/bootloader.md` — details behind [How the bootloader decides](#how-the-bootloader-decides).
 
 ---
