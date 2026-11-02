@@ -13,7 +13,7 @@
 //
 // FQBN: ClearCore:sam:clearcore
 // Compile: arduino-cli compile --fqbn ClearCore:sam:clearcore .
-// Upload:  arduino-cli upload  --fqbn ClearCore:sam:clearcore -p /dev/ttyACM0 .
+// Upload:  scripts/flash.sh examples/BlinkLED   (Windows: scripts\flash.ps1)
 // ======================================================================
 
 void setup() {
