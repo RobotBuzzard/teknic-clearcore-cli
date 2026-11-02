@@ -252,7 +252,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\flash.ps1 .\examples\BlinkLED
 powershell -ExecutionPolicy Bypass -File .\scripts\boot-app.ps1      # board left in the bootloader
 ```
 
-`flash.ps1` options: `-Port COMx` (the application-mode port; only needed if Windows lists the board without a COM number, and it must match the ClearCore's port), `-BootloaderTimeout` and `-AppReturnTimeout` (seconds, default 10), `-Retries`, `-RetryDelay`. Requires Windows PowerShell 5.1 or later (PowerShell 7 is supported too). A board attached to WSL with usbipd-win is invisible to Windows; both scripts say so and print the `usbipd detach` command. Windows COM ports are exclusive, so a port held by a Serial Monitor is reported (`<port> is held by another program`) before anything is compiled.
+`flash.ps1` options: `-Port COMx` (the application-mode port; only needed if Windows lists the board without a COM number, and it must match the ClearCore's port), `-BootloaderTimeout` and `-AppReturnTimeout` (seconds, default 10), `-Retries`, `-RetryDelay`. Tested with Windows PowerShell 5.1; written to also run under PowerShell 7. A board attached to WSL with usbipd-win is invisible to Windows; both scripts say so and print the `usbipd detach` command. Windows COM ports are exclusive, so a port held by a Serial Monitor is reported (`<port> is held by another program`) before anything is compiled.
 
 The bash scripts in `scripts/` don't run on Windows itself; to use them from a Windows PC, run them in WSL2 (see [WSL2](#wsl2-windows-subsystem-for-linux)). A board left in the bootloader starts its application again with `boot-app.ps1`, a single RESET press or a power cycle.
 
