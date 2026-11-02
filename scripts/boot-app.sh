@@ -24,8 +24,9 @@
 #
 # Exit codes:
 #   0  start requested, or the application is already running
-#   1  no permission to open the port, or no SAM-BA answer
-#   2  no ClearCore on the port
+#   1  no permission to open the port, the port is held by another
+#      process, or no SAM-BA answer
+#   2  the port doesn't exist, no ClearCore on it, or it vanished while opening it
 # ----------------------------------------------------------------------
 
 set -euo pipefail
@@ -46,7 +47,10 @@ if [[ ! -c "$PORT" ]]; then
 fi
 
 # Which USB device owns the port? sysfs: tty -> USB interface -> device.
-usb_dir="$(readlink -f "/sys/class/tty/$(basename "$PORT")/device/..")"
+# $PORT may be a symlink (/dev/clearcore-boot, /dev/serial/by-id/...), and
+# sysfs is named after the real tty.
+real_port="$(readlink -f -- "$PORT")"
+usb_dir="$(readlink -f "/sys/class/tty/$(basename "$real_port")/device/..")" || usb_dir=""
 vid="$(cat "$usb_dir/idVendor" 2>/dev/null || true)"
 pid="$(cat "$usb_dir/idProduct" 2>/dev/null || true)"
 
@@ -68,29 +72,51 @@ if [[ ! -r "$PORT" || ! -w "$PORT" ]]; then
     exit 1
 fi
 
+# Another program on the port (an upload, a serial monitor) would compete
+# for the reply, or be cut off by the reset. Skipped when lsof is missing.
+if command -v lsof >/dev/null 2>&1 && holders="$(lsof -t "$PORT" 2>/dev/null)" && [[ -n "$holders" ]]; then
+    echo "boot-app: $PORT is held by another process (PID ${holders//$'\n'/ }); close it first" >&2
+    exit 1
+fi
+
 # Raw bytes, and don't wait for carrier. The bootloader ignores the baud
 # rate.
-stty -F "$PORT" raw -echo clocal 921600
-exec 3<>"$PORT"
+stty -F "$PORT" raw -echo clocal 921600 || {
+    echo "boot-app: can't configure $PORT (did the board re-enumerate?); try again" >&2
+    exit 2
+}
+exec 3<>"$PORT" || {
+    echo "boot-app: can't open $PORT (did the board re-enumerate?); try again" >&2
+    exit 2
+}
 
-# Drop anything already waiting, switch the SAM-BA monitor to binary mode
-# (N#; this monitor doesn't answer it) and ask for its version (V#),
-# which it answers with a line like "v1.1 [Arduino:XYZ] ...\n\r". No
-# answer: write nothing.
+# Drop anything already waiting, then send N# and ask the monitor for its
+# version (V#), which it answers with a line like "v1.1 [Arduino:XYZ]
+# ...\n\r". This bootloader treats N# (bossac's opening command) as a
+# no-op and doesn't answer it, but right after a bossac session a V# sent
+# on its own often went unanswered; with N# first it is answered. One
+# retry, then give up without writing anything.
 read -r -t 0.2 -N 256 -u 3 _ || true
-printf 'N#' >&3
-sleep 0.05
-printf 'V#' >&3
-if ! IFS= read -r -t 2 -d $'\r' -u 3 reply || [[ "$reply" != v* ]]; then
-    echo "boot-app: no SAM-BA answer on $PORT; nothing written" >&2
+reply=""
+for _ in 1 2; do
+    printf 'N#' >&3
+    sleep 0.05
+    printf 'V#' >&3
+    if IFS= read -r -t 2 -d $'\r' -u 3 reply && [[ "$reply" == v* ]]; then
+        break
+    fi
+    reply=""
+done
+if [[ -z "$reply" ]]; then
+    echo "boot-app: no SAM-BA answer on $PORT; nothing written (is another program reading $PORT?)" >&2
     exit 1
 fi
 
 printf 'W%s,%s#' "$QUICK_BOOT_ADDR" "$QUICK_BOOT_MAGIC" >&3
 sleep 0.1
-# The reset drops the port, so an error on this last write is expected
-# and ignored (bossac does the same).
+# The device resets while we're still talking to it, so this write (and
+# the close) may fail; ignore errors, as bossac does.
 printf 'W%s,%s#' "$AIRCR_ADDR" "$AIRCR_SYSRESETREQ" >&3 2>/dev/null || true
-exec 3>&- 2>/dev/null || true
+exec 3>&-
 
 echo "boot-app: asked the bootloader to start the application"

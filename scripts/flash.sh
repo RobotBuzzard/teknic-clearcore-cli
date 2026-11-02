@@ -10,7 +10,9 @@
 # Usage:  flash.sh <sketch_dir> [port]
 #
 # Strategy:
-#   1. Preflight (port not held by Serial Monitor / screen / etc.)
+#   1. Preflight (port not held by Serial Monitor / screen / etc.),
+#      then the quick device checks (one board, port permission,
+#      board present) so those fail before the slow compile
 #   2. Compile to a clean build dir with arduino-cli
 #   3. Determine device state via USB VID/PID
 #       2890:8022 = application running
@@ -47,7 +49,8 @@
 #   1  preflight / compile / missing-dependency failure, or no
 #      permission to open the port (see 'dialout' in the README)
 #   2  device not detected (or more than one ClearCore connected)
-#   3  bootloader entry failed
+#   3  bootloader entry failed (on WSL: is bootloader mode, 2890:0022,
+#      shared with usbipd?)
 #   4  bossac flash failed after retries
 #   5  device didn't return to app mode after flash (on WSL: is app
 #      mode, 2890:8022, shared with usbipd?)
@@ -61,8 +64,9 @@ PORT="${2:-/dev/ttyACM0}"
 PORT_NAME="$(basename "$PORT")"
 FQBN="ClearCore:sam:clearcore"
 OFFSET="0x4000"
-BUILD_DIR="${TMPDIR:-/tmp}/cc-flash-build"
-BOSSAC_LOG="${TMPDIR:-/tmp}/cc-flash-bossac.log"
+CC_TMP="${TMPDIR:-/tmp}/cc-flash-$(id -u)"
+BUILD_DIR="$CC_TMP/build"
+BOSSAC_LOG="$CC_TMP/bossac.log"
 BOSSAC_RETRIES=3
 BOSSAC_RETRY_DELAY=2
 BL_POLL_TIMEOUT="${CC_BL_POLL_TIMEOUT:-10}"
@@ -99,7 +103,7 @@ cc_count() {
 
 cc_pid() {
     # Returns the ClearCore's current USB PID (8022 app, 0022 boot, empty if unplugged)
-    lsusb 2>/dev/null | awk '/ 2890:/ { split($6, a, ":"); print a[2]; exit }'
+    lsusb 2>/dev/null | awk '/ 2890:/ { split($6, a, ":"); print a[2]; exit }' || true
 }
 
 is_wsl() {
@@ -124,7 +128,8 @@ trigger_bootloader() {
     # stty opens the port (DTR up), sets 1200 baud, and closes it —
     # with hupcl set, the close drops DTR.
     if ! stty -F "$PORT" 1200 hupcl 2>/dev/null; then
-        err "Could not open $PORT at 1200 baud (permissions? see 'dialout' in the README)"
+        err "Could not open $PORT at 1200 baud (permissions? see 'dialout' in the README;"
+        err "if the sketch is hung, press RESET twice quickly and re-run flash.sh)"
         return 1
     fi
 
@@ -137,7 +142,14 @@ trigger_bootloader() {
         fi
         sleep 0.2
     done
-    err "Bootloader entry timed out after ${BL_POLL_TIMEOUT}s"
+    err "Bootloader entry timed out after ${BL_POLL_TIMEOUT}s (the board never showed up as 2890:0022)."
+    err "If the running sketch is hung or crashed, press RESET twice quickly (the board stays in the"
+    err "bootloader), then re-run flash.sh; it skips the touch when the board is already in the bootloader."
+    if is_wsl; then
+        err "On WSL: is bootloader mode (2890:0022) shared, and is 'usbipd attach --wsl --busid <BUSID> --auto-attach'"
+        err "still running? If re-attach is just slow, raise CC_BL_POLL_TIMEOUT (see 'WSL2' in the README)."
+        err "Once the board is attached in the bootloader, re-run flash.sh or start the application with scripts/boot-app.sh."
+    fi
     return 1
 }
 
@@ -160,6 +172,7 @@ flash_with_bossac() {
         #
         # Run bossac to completion and check its log afterwards; the
         # last lines are shown if it fails.
+        rm -f "$BOSSAC_LOG"
         "$bossac" -i -d --port="$PORT_NAME" -U -e -w -v --offset="$OFFSET" "$bin" \
             > "$BOSSAC_LOG" 2>&1 || true
         if grep -q "Verify successful" "$BOSSAC_LOG"; then
@@ -199,6 +212,10 @@ check_port_access() {
     fi
 }
 
+for v in BL_POLL_TIMEOUT APP_RETURN_TIMEOUT; do
+    [[ "${!v}" =~ ^[1-9][0-9]*$ ]] || { err "CC_${v} must be a whole number of seconds (got '${!v}')"; exit 1; }
+done
+
 # -------- run --------
 
 require_cmd arduino-cli "arduino-cli"
@@ -207,15 +224,34 @@ require_cmd stty "coreutils"
 require_cmd lsof "lsof"
 
 # Step 1: preflight. A missing port (preflight exit 2) isn't fatal here:
-# step 3 reports a missing device, with the usbipd hint on WSL.
+# the device check below reports a missing device, with the usbipd hint on WSL.
 preflight_rc=0
 "${SCRIPT_DIR}/preflight.sh" "$PORT" || preflight_rc=$?
 if [[ $preflight_rc -ne 0 && $preflight_rc -ne 2 ]]; then
     exit 1
 fi
 
+# Cheap device checks before the slow compile.
+if [[ "$(cc_count)" -gt 1 ]]; then
+    err "More than one ClearCore is connected. Unplug all but the one on $PORT and retry."
+    exit 2
+fi
+check_port_access
+if [[ -z "$(cc_pid)" ]]; then
+    err "ClearCore not detected on USB. Plug in the cable and retry (or press RESET twice quickly if the sketch doesn't start USB)."
+    if is_wsl; then
+        err "On WSL the device must be attached with usbipd-win — see 'WSL2' in the README."
+    fi
+    exit 2
+fi
+
 # Step 2: compile
 log "Compiling $SKETCH..."
+mkdir -p "$CC_TMP"
+if [[ ! -w "$CC_TMP" ]]; then
+    err "$CC_TMP is not writable (left by another user or sudo?). Remove it or set TMPDIR."
+    exit 1
+fi
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 arduino-cli compile --fqbn "$FQBN" --output-dir "$BUILD_DIR" "$SKETCH" || exit 1
@@ -236,12 +272,6 @@ log "Using bossac: $BOSSAC"
 log "Binary: $BIN ($(stat -c%s "$BIN") bytes)"
 
 # Steps 3-4: determine device state; enter the bootloader if needed
-if [[ "$(cc_count)" -gt 1 ]]; then
-    err "More than one ClearCore is connected. Unplug all but the one on $PORT and retry."
-    exit 2
-fi
-check_port_access
-
 case "$(cc_pid)" in
     8022)
         # App mode → trigger bootloader

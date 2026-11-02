@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # ----------------------------------------------------------------------
-# preflight.sh — verify the upload port is free before flashing.
+# preflight.sh — verify no process of yours holds the upload port.
 # ----------------------------------------------------------------------
-# arduino-cli's 1200-baud touch needs exclusive access to the port to
-# trigger bootloader entry. If anything else holds the port (Serial
-# Monitor, screen, minicom, cu, picocom, stray cat, etc.) the touch
-# silently fails and bossac reports "No device found" — the most
-# common bench-iteration failure mode for the ClearCore.
+# The 1200-baud touch (flash.sh's stty, or arduino-cli upload's own)
+# resets the board into the bootloader only when DTR drops while the line
+# rate is 1200, and Linux drops DTR only on the last close of the port.
+# If anything else holds the port open (Serial Monitor, screen, minicom,
+# cu, picocom, a stray cat), the touch does nothing or its open fails.
+# flash.sh then times out waiting for the bootloader, and a raw
+# arduino-cli upload fails with "Failed to open port at 1200bps" / "No
+# device found". This is the most common bench-iteration failure mode.
+# Note: lsof run as a normal user only sees your own processes.
 #
 # Exit codes:
 #   0 — port is free, safe to upload
@@ -37,14 +41,15 @@ if [[ -n "$HOLDERS" ]]; then
     {
         echo "preflight: $PORT is held by another process:"
         echo
-        ps -p $HOLDERS -o pid,comm,args 2>/dev/null || ps -p "$HOLDERS" 2>/dev/null
+        ps -o pid,comm,args -p "${HOLDERS//$'\n'/,}" 2>/dev/null || echo "  pids: ${HOLDERS//$'\n'/ }"
         echo
         echo "Close it before uploading. Common offenders:"
         echo "  serial-monitor   — Arduino IDE 2 Serial Monitor (close the panel / hit Disconnect)"
         echo "  screen / cu / minicom / picocom — old terminal session"
         echo "  cat              — stray 'cat /dev/ttyACM0' left running"
+        echo "  sudo screen/minicom — root-owned, invisible to this check without sudo"
     } >&2
     exit 1
 fi
 
-echo "preflight: $PORT is free."
+echo "preflight: $PORT is free (no process of yours holds it; root-owned holders need: sudo lsof $PORT)."
