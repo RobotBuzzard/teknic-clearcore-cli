@@ -52,7 +52,12 @@ $AircrAddr      = 'E000ED0C'
 $AircrSysReset  = '05FA0004'
 
 function Fail([int]$code, [string[]]$lines) {
-    foreach ($l in $lines) { [Console]::Error.WriteLine("boot-app: $l") }
+    # WriteErrorLine shows in the console, ISE and VS Code (stderr under
+    # -File); Write-Information also lands in a caller's *> redirection.
+    foreach ($l in $lines) {
+        $Host.UI.WriteErrorLine("boot-app: $l")
+        Write-Information "boot-app: $l"
+    }
     exit $code
 }
 
@@ -95,6 +100,12 @@ $ports = @(Get-ClearCorePorts)
 if (-not $Port) {
     $unique = @($ports | Select-Object -ExpandProperty Com -Unique)
     if ($unique.Count -eq 0) {
+        $devs = @(Get-ClearCoreNodes | Where-Object { $_.PNPDeviceID -notmatch '&MI_' })
+        if ($devs.Count -gt 0) {
+            $usbPid = [regex]::Match($devs[0].PNPDeviceID, 'PID_([0-9A-F]{4})').Groups[1].Value
+            Fail 2 @("the ClearCore is on USB (2890:$usbPid) but Windows hasn't given it a COM port yet",
+                     "(a first-time driver install can take a while); check Device Manager > Ports and retry")
+        }
         Fail 2 (@("no ClearCore COM port found; is the ClearCore connected?") + (Get-UsbipdHint))
     }
     if ($unique.Count -gt 1) {
@@ -153,49 +164,47 @@ function Close-Port {
 
 $reply = ''
 try {
-    # Drop anything already waiting, then send N# and ask the monitor for
-    # its version (V#), which it answers with a line like
-    # "v1.1 [Arduino:XYZ] ...\n\r". This bootloader treats N# (bossac's
-    # opening command) as a no-op and doesn't answer it, but right after a
-    # bossac session a V# sent on its own often went unanswered; with N#
-    # first it is answered. One retry, then give up without writing anything.
-    Start-Sleep -Milliseconds 200
-    $sp.DiscardInBuffer()
-    for ($try = 1; $try -le 2; $try++) {
-        # A timed-out ReadLine keeps partial data in SerialPort's own buffer;
-        # drop it so the retry starts clean, as boot-app.sh's fresh read does.
-        if ($try -gt 1) { $sp.DiscardInBuffer() }
-        $sp.Write('N#')
-        Start-Sleep -Milliseconds 50
-        $sp.Write('V#')
-        try {
-            $line = $sp.ReadLine()   # NewLine is "`r"
-            if ($line -match 'v\d+\.\d+ [^\r\n]*') { $reply = $Matches[0].Trim(); break }
-        } catch [System.TimeoutException] { }
+    try {
+        # Drop anything already waiting, then send N# and ask the monitor for
+        # its version (V#), which it answers with a line like
+        # "v1.1 [Arduino:XYZ] ...\n\r". This bootloader treats N# (bossac's
+        # opening command) as a no-op and doesn't answer it, but right after a
+        # bossac session a V# sent on its own often went unanswered; with N#
+        # first it is answered. One retry, then give up without writing anything.
+        # The retry doesn't flush, so a reply already queued is still read.
+        Start-Sleep -Milliseconds 200
+        $sp.DiscardInBuffer()
+        for ($try = 1; $try -le 2; $try++) {
+            $sp.Write('N#')
+            Start-Sleep -Milliseconds 50
+            $sp.Write('V#')
+            try {
+                $line = $sp.ReadLine()   # NewLine is "`r"
+                if ($line -match 'v\d+\.\d+ [^\r\n]*') { $reply = $Matches[0].Trim(); break }
+            } catch [System.TimeoutException] { }
+        }
+    } catch {
+        Fail 2 @("lost $Port while talking to it ($($_.Exception.Message)); did the board re-enumerate? Try again")
     }
-} catch {
-    Close-Port
-    Fail 2 @("lost $Port while talking to it ($($_.Exception.Message)); did the board re-enumerate? Try again")
-}
 
-if (-not $reply) {
-    Close-Port
-    Fail 1 @("no SAM-BA answer on $Port; nothing written (is another program reading $Port?)")
-}
-Write-Verbose "SAM-BA: $reply"
+    if (-not $reply) {
+        Fail 1 @("no SAM-BA answer on $Port; nothing written (is another program reading ${Port}?)")
+    }
+    Write-Verbose "SAM-BA: $reply"
 
-try {
-    $sp.Write("W$QuickBootAddr,$QuickBootMagic#")
-    Start-Sleep -Milliseconds 100
-} catch {
+    try {
+        $sp.Write("W$QuickBootAddr,$QuickBootMagic#")
+        Start-Sleep -Milliseconds 100
+    } catch {
+        Fail 2 @("lost $Port before the start command was written ($($_.Exception.Message)); try again")
+    }
+    # The device resets while we're still talking to it, so this write (and the
+    # close) may fail; ignore errors, as bossac does.
+    try { $sp.Write("W$AircrAddr,$AircrSysReset#") } catch { }
+    Start-Sleep -Milliseconds 50
+} finally {
     Close-Port
-    Fail 2 @("lost $Port before the start command was written ($($_.Exception.Message)); try again")
 }
-# The device resets while we're still talking to it, so this write (and the
-# close) may fail; ignore errors, as bossac does.
-try { $sp.Write("W$AircrAddr,$AircrSysReset#") } catch { }
-Start-Sleep -Milliseconds 50
-Close-Port
 
 Write-Host "boot-app: asked the bootloader to start the application"
 exit 0

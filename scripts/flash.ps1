@@ -35,7 +35,9 @@
 
 .PARAMETER Port
     COM port of the ClearCore in application mode. Default: auto-detect.
-    The bootloader's port is always auto-detected.
+    Only needed if Windows lists the ClearCore without a COM number; when a
+    port is detected, -Port must match it (the script stops otherwise, so a
+    wrong port is never touched). The bootloader's port is always auto-detected.
 
 .EXAMPLE
     .\scripts\flash.ps1 .\MySketch
@@ -44,11 +46,12 @@
 .NOTES
     Exit codes (same as flash.sh):
       0  success
-      1  compile / missing-dependency failure, or the port is held by
-         another program
-      2  device not detected (or more than one ClearCore connected)
+      1  preflight / compile / missing-dependency failure (including the
+         port being held by another program when checked before compiling)
+      2  device not detected, more than one ClearCore connected, or an invalid -Port
       3  bootloader entry failed
-      4  bossac flash failed after retries
+      4  bossac flash failed after retries (or the bootloader's port is
+         held by another program)
       5  device didn't return to app mode after flash
 #>
 [CmdletBinding()]
@@ -155,7 +158,13 @@ function Find-ArduinoCli {
 }
 
 function Find-Bossac {
-    $root = Join-Path $env:LOCALAPPDATA 'Arduino15\packages\arduino\tools\bossac'
+    # arduino-cli's data directory can be relocated; ask it, default otherwise.
+    $data = $null
+    try { $data = (& $ArduinoCli config get directories.data 2>$null | Select-Object -First 1) } catch { }
+    if (-not $data -or -not (Test-Path -LiteralPath "$data")) { $data = Join-Path $env:LOCALAPPDATA 'Arduino15' }
+    $root = Join-Path $data 'packages\arduino\tools\bossac'
+    $pinned = Join-Path $root '1.9.1-arduino1\bossac.exe'
+    if (Test-Path -LiteralPath $pinned -PathType Leaf) { return $pinned }
     $b = Get-ChildItem -Path $root -Recurse -Filter bossac.exe -ErrorAction SilentlyContinue |
         Sort-Object { [version](($_.Directory.Name -replace '^(\d+(\.\d+)*).*$', '$1')) } -ErrorAction SilentlyContinue |
         Select-Object -Last 1
@@ -259,9 +268,11 @@ function Invoke-Bossac([string]$bossac, [string]$bin) {
         } finally { $ErrorActionPreference = $prev }
         Set-Content -Path $BossacLog -Value $out -Encoding UTF8
         if ($out -match 'Verify successful') { return $true }
-        if ($out -match '(?i)access is denied|UnauthorizedAccess') {
-            Err "bossac couldn't open ${com}: another program (Serial Monitor, PuTTY...) holds the bootloader's port. Close it and retry."
-            return $false
+        if ($out -match 'No device found') {
+            # bossac prints this whenever it can't open the port; find out
+            # whether another program is holding it.
+            $held = Test-PortFree $com
+            if ($held -and $held -match 'held by another program') { Err $held; return $false }
         }
     }
     Err "bossac failed after $Retries attempts. Last 15 lines of bossac output ($BossacLog):"
@@ -285,6 +296,10 @@ if (-not (Test-Path -LiteralPath $Sketch -PathType Container)) { Err "sketch dir
 # pass arduino-cli a broken argument.
 $Sketch = (Resolve-Path -LiteralPath $Sketch).ProviderPath.TrimEnd('\', '/')
 if (-not (Test-Path -LiteralPath $BootApp -PathType Leaf)) { Err "boot-app.ps1 not found next to flash.ps1 ($BootApp)"; exit 1 }
+if ($Port) {
+    $Port = $Port.Trim().ToUpperInvariant()
+    if ($Port -notmatch '^COM\d+$') { Err "'$Port' isn't a COM port name (expected e.g. COM4)"; exit 2 }
+}
 $ArduinoCli = Find-ArduinoCli
 $Bossac = Find-Bossac
 
@@ -297,7 +312,8 @@ if ($dev.Count -eq 0) {
     exit 2
 }
 if ($dev.Pid -eq '8022') {
-    $appCom = if ($Port) { $Port.Trim().ToUpperInvariant() } else { $dev.Com }
+    if ($Port -and $dev.Com -and $Port -ne $dev.Com) { Err "$Port isn't the ClearCore's port (it is on $($dev.Com)); drop -Port or pass -Port $($dev.Com)."; exit 2 }
+    $appCom = if ($dev.Com) { $dev.Com } else { $Port }
     if (-not $appCom) { Err "ClearCore found (PID 8022) but no COM port for it; check Device Manager, or pass -Port COMx"; exit 2 }
     $held = Test-PortFree $appCom
     if ($held) { Err $held; exit 1 }
@@ -341,7 +357,8 @@ if (-not $dev.Pid) {
 }
 switch ($dev.Pid) {
     '8022' {
-        $appCom = if ($Port) { $Port.Trim().ToUpperInvariant() } else { $dev.Com }
+        if ($Port -and $dev.Com -and $Port -ne $dev.Com) { Err "$Port isn't the ClearCore's port (it is on $($dev.Com)); drop -Port or pass -Port $($dev.Com)."; exit 2 }
+        $appCom = if ($dev.Com) { $dev.Com } else { $Port }
         if (-not $appCom) { Err "ClearCore found (PID 8022) but no COM port for it; pass -Port COMx"; exit 2 }
         if (-not (Invoke-Touch $appCom)) { exit 3 }
     }
@@ -371,6 +388,11 @@ if ($back) {
 }
 
 $now = Get-ClearCore
+if ($now.Pid -eq '8022') {
+    Log "Device returned to application mode (PID 8022)"
+    Ok "Flash complete."
+    exit 0
+}
 if ($now.Pid -eq '0022' -and $now.Com) {
     # Still in the bootloader. Sending the start command again is safe.
     Log "Still in the bootloader - sending the start command again..."
